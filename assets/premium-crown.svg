@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 112" role="img" aria-label="WAGRAM Premium">
+  <defs>
+    <linearGradient id="goldBody" x1="18" y1="18" x2="104" y2="94" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff2a6"/>
+      <stop offset=".18" stop-color="#ffd968"/>
+      <stop offset=".42" stop-color="#f5a623"/>
+      <stop offset=".68" stop-color="#c97812"/>
+      <stop offset=".86" stop-color="#ffe18a"/>
+      <stop offset="1" stop-color="#a9570a"/>
+    </linearGradient>
+    <linearGradient id="goldSide" x1="20" y1="54" x2="108" y2="90" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9e5108"/>
+      <stop offset=".28" stop-color="#e99a20"/>
+      <stop offset=".56" stop-color="#ffd96c"/>
+      <stop offset=".8" stop-color="#bd6c0c"/>
+      <stop offset="1" stop-color="#7e3d08"/>
+    </linearGradient>
+    <linearGradient id="goldRim" x1="22" y1="78" x2="106" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff0a0"/>
+      <stop offset=".5" stop-color="#f7b936"/>
+      <stop offset="1" stop-color="#9d5008"/>
+    </linearGradient>
+    <linearGradient id="ruby" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ffb0a3"/>
+      <stop offset=".3" stop-color="#f04452"/>
+      <stop offset=".72" stop-color="#a9082b"/>
+      <stop offset="1" stop-color="#5d061b"/>
+    </linearGradient>
+    <radialGradient id="shine" cx="0" cy="0" r="1" gradientTransform="matrix(25 0 0 34 38 26)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3.2"/>
+      <feOffset dy="4"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".42"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="crownClip">
+      <path d="M13 29 37 49 63 10 89 49 115 29 103 83H25L13 29Z"/>
+    </clipPath>
+  </defs>
+  <g filter="url(#shadow)">
+    <path d="M13 29 37 49 63 10 89 49 115 29 103 83H25L13 29Z" fill="url(#goldBody)" stroke="#713a08" stroke-width="3.2" stroke-linejoin="round"/>
+    <g clip-path="url(#crownClip)">
+      <path d="M8 17 37 49 63 10 89 49 120 22 108 91 17 91Z" fill="url(#shine)"/>
+      <path d="M13 29 37 49 30 76 20 68Z" fill="#fff0a0" opacity=".5"/>
+      <path d="M63 10 67 48 89 49Z" fill="#fff4bb" opacity=".48"/>
+      <path d="M37 49 63 10 55 61 32 73Z" fill="#ffdc77" opacity=".68"/>
+      <path d="M89 49 115 29 104 70 79 74Z" fill="#8f4808" opacity=".28"/>
+      <path d="M25 73H103L100 87H28Z" fill="url(#goldSide)"/>
+      <path d="M18 82H110L106 94H22Z" fill="url(#goldRim)"/>
+    </g>
+    <path d="M25 83H103L108 94Q64 106 20 94Z" fill="url(#goldSide)" stroke="#713a08" stroke-width="2.5" stroke-linejoin="round"/>
+    <path d="M22 91Q64 101 106 91" fill="none" stroke="#fff0a0" stroke-width="2.4" stroke-linecap="round" opacity=".9"/>
+    <path d="M37 49 43 66M63 10 63 63M89 49 83 66" fill="none" stroke="#fff4bb" stroke-width="2" opacity=".72"/>
+    <g stroke="#6e1020" stroke-width="1.5">
+      <path d="m37 56 6 4-2 8-7 2-5-6 2-7Z" fill="url(#ruby)"/>
+      <path d="m63 40 7 5-2 9-8 3-6-7 2-8Z" fill="url(#ruby)"/>
+      <path d="m89 56 6 4-2 8-7 2-5-6 2-7Z" fill="url(#ruby)"/>
+    </g>
+    <g fill="#fff4dc" opacity=".9">
+      <path d="m34 58 3 2-2 3-3-2Z"/>
+      <path d="m60 43 3 2-2 3-3-2Z"/>
+      <path d="m86 58 3 2-2 3-3-2Z"/>
+    </g>
+    <circle cx="13" cy="29" r="4.2" fill="#ffe99a" stroke="#9a570d" stroke-width="1.8"/>
+    <circle cx="63" cy="10" r="4.6" fill="#fff1ad" stroke="#9a570d" stroke-width="1.8"/>
+    <circle cx="115" cy="29" r="4.2" fill="#ffe99a" stroke="#9a570d" stroke-width="1.8"/>
+  </g>
+</svg>
