@@ -1,8 +1,8 @@
 {
   "name": "WAGRAM",
   "short_name": "WAGRAM",
-  "description": "WAGRAM WhatsApp Messenger",
-  "start_url": "./",
+  "description": "WAGRAM Web App",
+  "start_url": "/",
   "display": "standalone",
   "background_color": "#03A233",
   "theme_color": "#03A233",
@@ -11,13 +11,19 @@
       "src": "./assets/icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     },
     {
       "src": "./assets/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     }
+  ],
+  "id": "/",
+  "scope": "/",
+  "display_override": [
+    "standalone",
+    "minimal-ui"
   ]
 }
