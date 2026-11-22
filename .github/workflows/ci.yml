@@ -29,11 +29,18 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install dependencies
+        run: npm install
+
       - name: Check JavaScript syntax
         run: |
           node --check app.js
           node --check connection.js
           node --check ai-chat-enhancements.js
+          node --check src/main.js
+
+      - name: Build production bundle
+        run: npm run build
 
       - name: Validate PWA manifest
         run: node -e "JSON.parse(require('node:fs').readFileSync('manifest.webmanifest', 'utf8')); console.log('manifest.webmanifest is valid JSON')"
