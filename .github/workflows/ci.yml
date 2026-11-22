@@ -1,0 +1,81 @@
+name: WAGRAM Frontend CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check app.js
+          node --check connection.js
+          node --check ai-chat-enhancements.js
+
+      - name: Validate PWA manifest
+        run: node -e "JSON.parse(require('node:fs').readFileSync('manifest.webmanifest', 'utf8')); console.log('manifest.webmanifest is valid JSON')"
+
+      - name: Validate frontend entry points
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const requiredFiles = [
+            'index.html',
+            'style.css',
+            'app.js',
+            'connection.js',
+            'ai-chat-enhancements.js',
+            'manifest.webmanifest'
+          ];
+
+          for (const file of requiredFiles) {
+            if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+              console.error(`Missing required frontend file: ${file}`);
+              process.exitCode = 1;
+            }
+          }
+
+          if (process.exitCode) process.exit(process.exitCode);
+
+          const html = fs.readFileSync('index.html', 'utf8');
+          const references = [...html.matchAll(/(?:src|href)=["']([^"']+)["']/g)]
+            .map((match) => match[1].split('?')[0])
+            .filter((reference) => /\.(?:js|css|webmanifest)$/i.test(reference))
+            .filter((reference) => !/^(?:https?:)?\/\//i.test(reference));
+
+          for (const reference of references) {
+            const localPath = path.normalize(reference.replace(/^\.\//, ''));
+            if (!fs.existsSync(localPath)) {
+              console.error(`Broken local frontend reference: ${reference}`);
+              process.exitCode = 1;
+            }
+          }
+
+          if (process.exitCode) process.exit(process.exitCode);
+          console.log('Frontend entry points and local script/style references are valid');
+          NODE
