@@ -952,9 +952,7 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </div>
 
-  <!-- [MODIFIED] Bump the AI decision trace script version to invalidate stale Telegram WebView cache. -->
-  <script src="app.js?v=20261120-ai-decision-trace-v2"></script>
-  <script src="ai-chat-enhancements.js?v=20261120-ai-composer-fix-v2"></script>
-  <script src="connection.js?v=20261109-silent-pause-resume"></script>
+  <!-- [MODIFIED] Vite entry point; legacy scripts retain their original execution order. -->
+  <script type="module" src="/src/main.js"></script>
 </body>
 </html>
