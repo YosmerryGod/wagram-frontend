@@ -1,0 +1,5337 @@
+/* =========================================================
+   DOOD BOT Mini App
+   Halaman: Chat, Panggilan, Kontak, Akun
+
+   Alamat API default: /api/miniapp (satu domain dengan server).
+   Jika Mini App di-host di domain lain, set sebelum app.js dimuat:
+     <script>window.MINIAPP_API_BASE = "https://domain-kamu.com/api/miniapp";</script>
+   ========================================================= */
+
+(() => {
+  "use strict";
+
+  const tg = window.Telegram?.WebApp || null;
+
+  const API_BASE = String(
+    window.MINIAPP_API_BASE || "/api/miniapp"
+  ).replace(/\/+$/, "");
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+
+  const state = {
+    page: "chats",
+    me: null,
+    membership: null, // [ADDED] Server-authoritative role and membership state.
+    whatsappSessions: [],
+    whatsappSessionLimit: 1,
+    activeSessionId: null,
+    expandedSettingsSessionId: null, // [ADDED] Session whose individual settings dropdown is open.
+    aiBusinessAutoReplyEnabled: false, // [ADDED] Server-backed Auto Reply state for the selected session.
+    aiBusinessAutoReplySessionId: null, // [ADDED] Session associated with the loaded Auto Reply state.
+    aiBusinessAutoReplyLoadingSessionId: null, // [ADDED] Prevent duplicate preference fetches.
+
+    chats: [],
+    chatsLoaded: false,
+    chatCounts: { all: 0, unread: 0, favorites: 0, archived: 0 },
+    filter: "all",
+    search: "",
+    messageHits: [],
+    currentChat: null,
+    currentChatMessageSignature: "",
+
+    calls: [],
+    callsLoaded: false,
+    callsStale: false,
+    callFilter: "all",
+    callSearch: "",
+
+    contacts: [],
+    contactsLoaded: false,
+    contactSearch: "",
+    editingId: null,
+    contactTab: "book", // [ADDED]
+    customerContacts: [],
+    customerContactsLoaded: false,
+    editingCustomerId: null,
+    employeeWhitelist: [],
+    employeeWhitelistLoaded: false,
+    editingEmployeeId: null
+  };
+
+  const PAGES = {
+    chats: "#chatPage",
+    aiBusiness: "#aiBusinessPage", // [ADDED] Dedicated AI Business conversation page.
+    calls: "#callsPage",
+    contacts: "#contactsPage",
+    connections: "#connectionsPage",
+    automation: "#automationPage",
+    account: "#accountPage",
+    premium: "#premiumPage" // [ADDED] Dedicated Premium subscription page.
+  };
+
+  const NAVS = {
+    chats: "#messagesNav",
+    calls: "#callsNav",
+    contacts: "#contactsNav",
+    account: "#profileNav"
+  };
+
+  // [ADDED] Restore the last main page per Telegram account after a Mini App reload.
+  const LAST_PAGE_STORAGE_PREFIX = "wagram-last-page:";
+  function getLastPageStorageKey() {
+    const telegramUserId = String(tg?.initDataUnsafe?.user?.id || "guest");
+    return LAST_PAGE_STORAGE_PREFIX + telegramUserId;
+  }
+
+  function getLastVisitedPage() {
+    try {
+      const savedPage = localStorage.getItem(getLastPageStorageKey());
+      if (!savedPage || !Object.prototype.hasOwnProperty.call(PAGES, savedPage)) return "chats";
+      // Premium is a purchase flow, not a page to reopen after reload.
+      return savedPage === "premium" ? "account" : savedPage;
+    } catch {
+      return "chats";
+    }
+  }
+
+  function saveLastVisitedPage(page) {
+    try {
+      // [ADDED] If reload happens inside Premium, resume at Profile instead.
+      localStorage.setItem(getLastPageStorageKey(), page === "premium" ? "account" : page);
+    } catch {
+      // Continue normally if storage is unavailable.
+    }
+  }
+
+  const FILTER_TITLES = {
+    all: "Percakapan",
+    unread: "Belum dibaca",
+    favorites: "Favorit",
+    archived: "Arsip"
+  };
+
+  const MEDIA_LABELS = {
+    image: "Foto",
+    video: "Video",
+    audio: "Audio",
+    ptt: "Pesan suara",
+    document: "Dokumen",
+    sticker: "Stiker",
+    location: "Lokasi",
+    contact: "Kontak",
+    poll: "Polling",
+    call: "Panggilan"
+  };
+
+  const ERROR_TEXT = {
+    INVALID_TELEGRAM_AUTH: "Buka aplikasi ini dari dalam Telegram.",
+    USER_NOT_REGISTERED: "Kirim /start ke bot Telegram terlebih dahulu.",
+    INVALID_NAME: "Nama kontak wajib diisi.",
+    INVALID_PHONE: "Nomor HP tidak valid. Periksa kembali nomornya.",
+    DUPLICATE_PHONE: "Nomor ini sudah tersimpan sebagai kontak lain.",
+    CONTACT_LIMIT: "Batas jumlah kontak sudah tercapai.",
+    CONTACT_NOT_FOUND: "Kontak tidak ditemukan.",
+    CHAT_NOT_FOUND: "Chat tidak ditemukan."
+  };
+
+  /* ---------------------------------------------------------
+     Utilitas
+     --------------------------------------------------------- */
+
+  function escapeHTML(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  const enc = encodeURIComponent;
+
+  function icon(name, extraClass = "") {
+    return `<svg class="i ${extraClass}"><use href="#i-${name}"/></svg>`;
+  }
+
+  function getInitials(name) {
+    const words = String(name || "")
+      .replace(/^\+/, "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
+    if (!words.length) return "?";
+
+    if (/^\d/.test(words[0])) return "#";
+
+    const first = [...words[0]][0] || "?";
+    const second = words.length > 1 ? [...words[1]][0] : "";
+
+    return (first + second).toUpperCase();
+  }
+
+  function avatarHue(seed) {
+    let hash = 0;
+
+    for (const char of String(seed || "")) {
+      hash = (hash * 31 + char.codePointAt(0)) % 360;
+    }
+
+    return hash;
+  }
+
+  function avatar(name, seed, extraClass = "", pictureUrl = "") {
+    const photo = pictureUrl
+      ? `<img class="avatar-photo" src="${escapeHTML(pictureUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+      : escapeHTML(getInitials(name));
+
+    return `<div class="avatar ${extraClass}" style="--h:${avatarHue(seed || name)}">${photo}</div>`;
+  }
+
+  // Timestamp bisa detik (WhatsApp) atau milidetik.
+  function toMs(value) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number) || number <= 0) return 0;
+
+    return number < 1e12 ? number * 1000 : number;
+  }
+
+  function startOfDay(ms) {
+    const date = new Date(ms);
+
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  }
+
+  function timeOnly(ms) {
+    return new Date(ms).toLocaleTimeString("id-ID", {
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  }
+
+  function shortDate(ms) {
+    const sameYear = new Date(ms).getFullYear() === new Date().getFullYear();
+
+    return new Date(ms).toLocaleDateString("id-ID", {
+      day: "numeric",
+      month: "short",
+      ...(sameYear ? {} : { year: "numeric" })
+    });
+  }
+
+  // Waktu di daftar chat: jam / Kemarin / tanggal.
+  function formatListTime(value) {
+    const ms = toMs(value);
+
+    if (!ms) return "";
+
+    const today = startOfDay(Date.now());
+
+    if (ms >= today) return timeOnly(ms);
+    if (ms >= today - 864e5) return "Kemarin";
+
+    return shortDate(ms);
+  }
+
+  function dayLabel(ms) {
+    const today = startOfDay(Date.now());
+
+    if (ms >= today) return "Hari ini";
+    if (ms >= today - 864e5) return "Kemarin";
+
+    return new Date(ms).toLocaleDateString("id-ID", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric"
+    });
+  }
+
+  function formatPhone(phone) {
+    const digits = String(phone || "").replace(/\D/g, "");
+
+    return digits ? `+${digits}` : "";
+  }
+
+  let toastTimer = 0;
+
+  function showToast(message) {
+    const toast = $("#toast");
+
+    if (!toast) return;
+
+    toast.textContent = message;
+    toast.classList.remove("hidden");
+
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.add("hidden"), 2800);
+  }
+
+  function confirmAction(message) {
+    return new Promise((resolve) => {
+      if (tg?.showConfirm) {
+        tg.showConfirm(message, (ok) => resolve(Boolean(ok)));
+      } else {
+        resolve(window.confirm(message));
+      }
+    });
+  }
+
+  function openWhatsApp(phone) {
+    const digits = String(phone || "").replace(/\D/g, "");
+
+    if (!digits) return;
+
+    const url = `https://wa.me/${digits}`;
+
+    if (tg?.openLink) {
+      tg.openLink(url);
+    } else {
+      window.open(url, "_blank", "noopener");
+    }
+  }
+
+  function haptic(type) {
+    try {
+      tg?.HapticFeedback?.notificationOccurred(type);
+    } catch {
+      /* tidak penting */
+    }
+  }
+
+  function emptyState(iconName, title, text, actionHTML = "") {
+    return `
+      <div class="empty">
+        <div class="empty-icon">${icon(iconName)}</div>
+        <h3>${escapeHTML(title)}</h3>
+        <p>${escapeHTML(text)}</p>
+        ${actionHTML}
+      </div>`;
+  }
+
+  function errorState(message, retryId) {
+    return `
+      <div class="error-state">
+        <div>${escapeHTML(message)}</div>
+        <button id="${retryId}" class="secondary-button" type="button">Coba lagi</button>
+      </div>`;
+  }
+
+  /* ---------------------------------------------------------
+     API
+     --------------------------------------------------------- */
+
+  async function api(path, options = {}) {
+    const headers = {
+      "X-Telegram-Init-Data": tg?.initData || "",
+      ...(options.body ? { "Content-Type": options.contentType || "application/json" } : {}), // [MODIFIED]
+      ...(state.activeSessionId && path !== "/me" && path !== "/account" && path !== "/sessions" && !path.startsWith("/premium/") ? { "X-WAGRAM-Session-ID": state.activeSessionId } : {}),
+      ...options.headers
+    };
+
+    let response;
+
+    try {
+      response = await fetch(API_BASE + path, { ...options, headers });
+    } catch {
+      throw new Error("Tidak dapat terhubung ke server.");
+    }
+
+    let data = null;
+
+    try {
+      data = await response.json();
+    } catch {
+      /* respons bukan JSON */
+    }
+
+    if (!response.ok || data?.ok === false) {
+      const apiError = new Error(
+        ERROR_TEXT[data?.error] ||
+        data?.message ||
+        (response.status === 413
+          ? "Server menolak ukuran data yang dikirim."
+          : `Permintaan gagal (${response.status}).`)
+      );
+      apiError.status = response.status; // [ADDED]
+      apiError.code = data?.error || ""; // [ADDED]
+      throw apiError;
+    }
+
+    return data;
+  }
+
+  /* ---------------------------------------------------------
+     Navigasi
+     --------------------------------------------------------- */
+
+  function closeConversationUI() {
+    $("#conversationPage").classList.add("hidden");
+    $("#topbar").classList.remove("hidden");
+    document.body.classList.remove("in-chat");
+    state.currentChat = null;
+
+    try {
+      tg?.BackButton?.hide();
+    } catch {
+      /* tidak penting */
+    }
+  }
+
+  function setPage(page) {
+    state.page = page;
+    saveLastVisitedPage(page); // [ADDED] Persist the active page for the next Mini App reload.
+    closeTopbarSearch(false);
+    updateTopbarTitle();
+    // [ADDED] Show the add-contact action only on the Contacts page.
+    $("#addContactButton").classList.toggle("hidden", page !== "contacts");
+    $("#bottomNav").classList.toggle("hidden", page === "premium" || page === "aiBusiness");
+    document.body.classList.toggle("premium-page-active", page === "premium");
+    closeConversationUI();
+    // [ADDED] WAMO AI uses the same full-screen conversation layout as WhatsApp chats.
+    $("#topbar").classList.toggle("hidden", page === "aiBusiness");
+    document.body.classList.toggle("in-chat", page === "aiBusiness");
+
+    for (const [key, selector] of Object.entries(PAGES)) {
+      $(selector).classList.toggle("hidden", key !== page);
+    }
+
+    for (const [key, selector] of Object.entries(NAVS)) {
+      const nav = $(selector);
+
+      nav.classList.toggle("selected", key === page);
+
+      if (key === page) {
+        nav.setAttribute("aria-current", "page");
+      } else {
+        nav.removeAttribute("aria-current");
+      }
+    }
+
+    if (page === "calls") {
+      // [MODIFIED] Refresh first, then mark calls as seen after they are displayed.
+      loadCalls();
+    }
+
+    if (page === "contacts") {
+      if (!state.contactsLoaded) loadContacts();
+      if (!state.customerContactsLoaded) loadCustomerContacts();
+      if (!state.employeeWhitelistLoaded) loadEmployeeWhitelist();
+      updateContactDirectoryView();
+    }
+
+    if (page === "account") {
+      renderAccount();
+      loadMembership(); // [ADDED] Refresh membership whenever Profile is opened.
+      loadWhatsAppAccount();
+      renderNotificationPreferences();
+    }
+
+    window.scrollTo(0, 0);
+  }
+
+  // [ADDED] Keep the compact top bar title in sync with the active tab.
+  function updateTopbarTitle() {
+    const titles = {
+      chats: "Pesan",
+      aiBusiness: "WAMO AI", // [ADDED] Title for the WAMO AI conversation.
+      calls: "Panggilan",
+      contacts: "Kontak",
+      account: "Profil",
+      premium: "WAGRAM Premium"
+    };
+
+    $("#topbarTitle").textContent = titles[state.page] || "Pesan";
+    $("#topbarSearchInput").placeholder = state.page === "calls"
+      ? "Cari nama atau nomor"
+      : state.page === "contacts"
+        ? "Cari nama atau nomor"
+        : "Cari chat atau pesan";
+  }
+
+  // [ADDED] Expand/collapse the top-bar search without shifting the theme button.
+  function openTopbarSearch() {
+    const topbar = $("#topbar");
+    const input = $("#topbarSearchInput");
+    const target = state.page === "calls"
+      ? $("#callsSearchInput")
+      : state.page === "contacts"
+        ? (state.contactTab === "customers" ? $("#customerContactsSearchInput") : state.contactTab === "employees" ? $("#employeeWhitelistSearchInput") : $("#contactsSearchInput"))
+        : state.page === "chats"
+          ? $("#searchInput")
+          : null;
+
+    topbar.classList.add("search-open");
+    $("#searchToggleButton").setAttribute("aria-expanded", "true");
+    $("#searchToggleButton").setAttribute("aria-label", "Cari");
+    input.value = target?.value || "";
+    requestAnimationFrame(() => input.focus());
+  }
+
+  function closeTopbarSearch(restoreFocus = true) {
+    const topbar = $("#topbar");
+    if (!topbar.classList.contains("search-open")) return;
+
+    topbar.classList.remove("search-open");
+    $("#searchToggleButton").setAttribute("aria-expanded", "false");
+    $("#searchToggleButton").setAttribute("aria-label", "Cari");
+    $("#topbarSearchInput").blur();
+
+    if (restoreFocus) {
+      $("#topbarTitle").focus?.();
+    }
+  }
+
+  function handleTopbarSearch() {
+    const value = $("#topbarSearchInput").value;
+    const target = state.page === "calls"
+      ? $("#callsSearchInput")
+      : state.page === "contacts"
+        ? (state.contactTab === "customers" ? $("#customerContactsSearchInput") : state.contactTab === "employees" ? $("#employeeWhitelistSearchInput") : $("#contactsSearchInput"))
+        : state.page === "chats"
+          ? $("#searchInput")
+          : null;
+
+    if (!target) return;
+    target.value = value;
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function refreshCurrentPage() {
+    if (state.page === "chats") return loadChats();
+    if (state.page === "calls") return loadCalls();
+    if (state.page === "contacts") return loadContacts();
+
+    return loadMe();
+  }
+
+  /* ---------------------------------------------------------
+     Akun
+     --------------------------------------------------------- */
+
+  async function loadMe() {
+    try {
+      const data = await api("/me");
+
+      state.me = data.user;
+
+      const name = state.me.firstName || state.me.username || "pengguna";
+
+      $("#connectionStatus").textContent = `Terhubung sebagai ${name}`;
+      renderAccount();
+      await Promise.all([
+        loadMembership(),
+        loadWhatsAppAccount()
+      ]);
+      renderNotificationPreferences();
+    } catch (error) {
+      $("#connectionStatus").textContent = error.message;
+    }
+  }
+
+  // [ADDED] Fetch the active membership from the authenticated server API.
+  async function loadMembership() {
+    const tier = $(".profile-tier");
+    if (!tier) return;
+
+    try {
+      const data = await api("/account");
+      state.membership = data.account || null;
+      // [ADDED] Re-evaluate the saved active session after the server confirms membership status.
+      await loadWhatsAppSessions();
+      renderMembership();
+      renderAIBusinessToggle();
+      renderWagramAiPinnedRow();
+      renderNotificationPreferences(); // [ADDED] Reapply notification access after the membership refresh.
+      renderFreePauseCountdown(); // [ADDED] Show countdown after membership is known.
+      // [ADDED] Re-render chat rows after the server confirms the plan; chats and membership load in parallel on startup.
+      if (state.chatsLoaded && state.page === "chats") renderChats();
+    } catch (error) {
+      console.error("Could not load WAGRAM membership:", error);
+      if (!state.membership) {
+        tier.textContent = "PLAN TIDAK TERSEDIA";
+        tier.removeAttribute("title");
+        tier.classList.remove("is-premium", "is-admin");
+      }
+    }
+  }
+
+  // [MODIFIED] Show Premium and its live days-hours-minutes expiry countdown in one tier badge.
+  function renderMembership() {
+    const tier = $(".profile-tier");
+    if (!tier) return;
+
+    const membership = state.membership;
+    const upgradeButton = $("#upgradePremiumButton");
+    const meta = $("#profileMembershipMeta");
+    const planLabels = {
+      free: "FREE TIER",
+      "premium-a": "PREMIUM A",
+      "premium-b": "PREMIUM B",
+      "premium-c": "PREMIUM C"
+    };
+
+    if (!membership) {
+      tier.textContent = "FREE TIER";
+      tier.removeAttribute("title");
+      tier.classList.remove("is-premium", "is-admin");
+      if (upgradeButton) upgradeButton.innerHTML = '<img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="" aria-hidden="true"> Upgrade Premium';
+      if (meta) meta.textContent = "Nikmati fitur dasar WAGRAM";
+      return;
+    }
+
+    const expiryDate = membership.plan_expires_at
+      ? new Date(membership.plan_expires_at)
+      : null;
+    const hasExpiry = expiryDate && !Number.isNaN(expiryDate.getTime());
+    const isExpired = hasExpiry && expiryDate.getTime() <= Date.now();
+    const isPremium = Boolean(membership.plan && membership.plan !== "free" && !isExpired);
+    const rawPlanLabel = String(membership.plan_label || planLabels[membership.plan] || "Premium");
+    const remainingMs = hasExpiry ? Math.max(0, expiryDate.getTime() - Date.now()) : 0;
+    const totalMinutes = Math.floor(remainingMs / 60000);
+    const remainingDays = Math.floor(totalMinutes / 1440);
+    const remainingHours = Math.floor((totalMinutes % 1440) / 60);
+    const remainingMinutes = totalMinutes % 60;
+    const expiryCountdown = `${remainingDays}d ${String(remainingHours).padStart(2, "0")}h ${String(remainingMinutes).padStart(2, "0")}m`; // [MODIFIED] Compact countdown units save badge space.
+
+    // [MODIFIED] Keep the remaining subscription time in the Premium badge only.
+    tier.textContent = isPremium
+      ? (hasExpiry ? `PREMIUM · ${expiryCountdown}` : "PREMIUM")
+      : "FREE TIER";
+    tier.classList.toggle("is-premium", isPremium);
+    tier.classList.toggle("is-admin", membership.role === "admin");
+
+    if (upgradeButton) {
+      upgradeButton.innerHTML = isPremium
+        ? '<img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="" aria-hidden="true"> Perpanjang Premium'
+        : '<img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="" aria-hidden="true"> Upgrade Premium';
+    }
+
+    // [MODIFIED] Remove the separate expiry-date line below the tier badge.
+    if (meta) meta.textContent = isPremium
+      ? ""
+      : (isExpired ? "Masa Premium telah berakhir" : ""); // [MODIFIED] Keep the Free Tier badge clean without supporting text.
+
+    const expiry = hasExpiry
+      ? expiryDate.toLocaleString("id-ID", {
+          dateStyle: "medium",
+          timeStyle: "short",
+          timeZone: "Asia/Jakarta"
+        }) + " WIB"
+      : "Tidak ada batas waktu";
+
+    tier.title = [
+      `Role: ${membership.role || "user"}`,
+      `Plan: ${rawPlanLabel}`,
+      `Batas akun WhatsApp: ${membership.sessions_limit || 1}`,
+      `Berlaku sampai: ${expiry}`
+    ].join("\\n");
+  }
+
+  function renderAccount() {
+    const me = state.me;
+
+    if (!me) return;
+
+    const fullName = [me.firstName, me.lastName].filter(Boolean).join(" ");
+    const name = fullName || me.username || "Pengguna Telegram";
+
+    $("#accountName").textContent = name;
+    $("#accountUsername").textContent = me.username ? `@${me.username}` : `ID ${me.id}`;
+
+    const accountAvatar = $("#accountAvatar");
+    const accountPhoto = $("#accountPhoto");
+    const photoUrl = me.photoUrl || me.photo_url || me.photoURL || "";
+
+    $("#accountInitials").textContent = getInitials(name);
+    accountAvatar.style.setProperty("--h", avatarHue(name));
+
+    if (photoUrl) {
+      accountPhoto.src = photoUrl;
+      accountPhoto.classList.remove("hidden");
+      $("#accountInitials").classList.add("hidden");
+    } else {
+      accountPhoto.removeAttribute("src");
+      accountPhoto.classList.add("hidden");
+      $("#accountInitials").classList.remove("hidden");
+    }
+  }
+
+
+  // [ADDED] Only an unexpired Premium membership may use secondary WhatsApp sessions.
+  function hasActivePremiumMembership() {
+    const membership = state.membership;
+    // Membership is loaded asynchronously; defer the lock decision until the server responds.
+    if (!membership) return true;
+    if (!membership.plan || membership.plan === "free") return false;
+    if (!membership.plan_expires_at) return true;
+    const expiry = new Date(membership.plan_expires_at).getTime();
+    return Number.isFinite(expiry) && expiry > Date.now();
+  }
+
+  // [ADDED] Expired and Free users can access only their primary WhatsApp session.
+  function isWhatsAppSessionLocked(session) {
+    return Boolean(session && !session.is_primary && !hasActivePremiumMembership());
+  }
+
+  // [ADDED] Load WhatsApp sessions and restore the selected account.
+  async function loadWhatsAppSessions() {
+    const data = await api("/sessions");
+    state.whatsappSessions = data.sessions || [];
+    // [ADDED] Use the server's linked-account count; pending QR/connecting records are not linked accounts.
+    state.whatsappSessionCount = Math.max(
+      0,
+      Number(data.count ?? state.whatsappSessions.length) || 0
+    );
+    // [MODIFIED] Prefer the API limit, then the already-loaded membership limit.
+    state.whatsappSessionLimit = Math.max(
+      1,
+      Number(data.limit ?? state.membership?.sessions_limit ?? 1) || 1
+    );
+    const saved = localStorage.getItem("wagram-active-whatsapp-session");
+    const savedSession = state.whatsappSessions.find((item) => item.session_id === saved);
+    const selected = savedSession && !isWhatsAppSessionLocked(savedSession)
+      ? savedSession
+      : state.whatsappSessions.find((item) => item.is_primary) || state.whatsappSessions[0];
+    state.activeSessionId = selected ? selected.session_id : null;
+    if (selected) localStorage.setItem("wagram-active-whatsapp-session", selected.session_id);
+    renderWhatsAppSessions();
+    return selected;
+  }
+
+  function renderWhatsAppSessions() {
+    const list = $("#whatsappSessionList");
+    if (!list) return;
+    list.innerHTML = (state.whatsappSessions || []).map((session, index) => {
+      const active = session.session_id === state.activeSessionId;
+      const status = session.status || session.connection_status || "disconnected";
+      const labels = { connected: "Terhubung", connecting: "Menghubungkan", qr: "Menunggu QR", paused: "Pause", disconnected: "Terputus", logged_out: "Keluar" };
+      const number = session.phone_number ? "+" + String(session.phone_number).replace(/^\\+/, "") : "Nomor belum terhubung";
+      const label = session.label || (session.is_primary ? "WhatsApp utama" : "WhatsApp " + (index + 1));
+      const locked = isWhatsAppSessionLocked(session);
+      return '<button class="whatsapp-session-item' + (active ? ' is-active' : '') + (locked ? ' is-session-locked' : '') + '" type="button" data-session-select="' + escapeHTML(session.session_id) + '" aria-label="' + escapeHTML(label) + (locked ? ', Premium diperlukan' : '') + '">' + '<span class="whatsapp-session-avatar">' + icon("whatsapp") + '</span>' + '<span class="whatsapp-session-info"><strong>' + escapeHTML(label) + '</strong><small>' + escapeHTML(number) + '</small></span>' + '<span class="whatsapp-session-status status-' + escapeHTML(status) + '">' + escapeHTML(labels[status] || status) + '</span>' + (locked ? '<span class="whatsapp-session-lock" aria-label="Premium diperlukan"><img class="premium-crown-svg" src="./assets/premium-crown.svg" alt=""></span>' : active ? '<span class="whatsapp-session-check">✓</span>' : '') + '</button>';
+    }).join("");
+    // [ADDED] Keep all linked accounts visible in one Profile card, each with its own actions.
+    const accountRows = $("#whatsappAccountRows");
+    // [MODIFIED] Only render genuinely linked or explicitly paused WhatsApp accounts.
+    const visibleSessions = (state.whatsappSessions || []).filter((session) => {
+      const status = session.status || session.connection_status || "disconnected";
+      return status === "connected" || status === "paused";
+    });
+    const hasVisibleSessions = visibleSessions.length > 0;
+    if (accountRows) {
+      // [MODIFIED] Keep account rows in their original positions; selection only changes the checkmark.
+      accountRows.innerHTML = visibleSessions.filter((session) => !session.is_primary).map((session, index) => {
+        const status = session.status || session.connection_status || "disconnected";
+        const labels = { connected: "Connected", connecting: "Connecting", qr: "Menunggu QR", paused: "Pause", disconnected: "Connect", logged_out: "Disconnected" };
+        const number = session.phone_number ? "+" + String(session.phone_number).replace(/^\\+/, "") : "Nomor belum terhubung";
+        const label = session.display_name || session.label || (session.is_primary ? "WhatsApp utama" : "WhatsApp " + (index + 1));
+        const active = session.session_id === state.activeSessionId;
+        const locked = isWhatsAppSessionLocked(session);
+        const picture = session.picture_url
+          ? '<img src="' + escapeHTML(session.picture_url) + '" alt="" loading="lazy" referrerpolicy="no-referrer">'
+          : "";
+        return '<div class="whatsapp-account-row' + (active ? ' is-active' : '') + '" data-account-row="' + escapeHTML(session.session_id) + '">' +
+          '<button class="whatsapp-account-select' + (locked ? ' is-session-locked' : '') + '" type="button" data-account-select="' + escapeHTML(session.session_id) + '" aria-label="' + (locked ? 'Premium diperlukan untuk memilih ' : 'Pilih akun ') + escapeHTML(label) + '">' +
+          '<span class="whatsapp-account-avatar' + (active ? ' is-selected' : '') + '">' + picture + (locked ? '<span class="whatsapp-session-lock whatsapp-avatar-lock" aria-label="Premium diperlukan"><img class="premium-crown-svg" src="./assets/premium-crown.svg" alt=""></span>' : '') + (active ? '<span class="whatsapp-account-selected-check" aria-label="Dipilih">✓</span>' : '') + '</span>' +
+          '<span class="whatsapp-account-copy"><strong>' + escapeHTML(label) + '</strong><span>' + escapeHTML(number) + '</span></span>' +
+          '<span class="whatsapp-connection-state' + (status === "connected" ? ' is-connected' : status === "paused" ? ' is-paused' : status === "connecting" ? ' is-connecting' : '') + '"><i></i> ' + escapeHTML(labels[status] || status) + '</span></button>' +
+          '<button class="whatsapp-account-row-chevron" type="button" data-account-settings-toggle="' + escapeHTML(session.session_id) + '" aria-label="Pengaturan ' + escapeHTML(label) + '" aria-expanded="' + String(state.expandedSettingsSessionId === session.session_id) + '">' + icon("back") + '</button></div>' +
+          '<div class="whatsapp-account-settings-slot" data-account-settings-slot="' + escapeHTML(session.session_id) + '"></div>';
+      }).join("");
+    }
+    // [MODIFIED] Pending secondary sessions are hidden from linked-account capacity calculations.
+    const linkedSessionCount = Number(state.whatsappSessionCount ?? state.whatsappSessions.length) || 0;
+    const canAdd = linkedSessionCount < state.whatsappSessionLimit;
+    const add = $("#createWhatsAppSessionButton");
+    if (add) add.innerHTML = canAdd ? icon("plus") + " Tambah akun WhatsApp" : '<img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="" aria-hidden="true"> Upgrade untuk tambah akun';
+    $("#whatsappSessionLimitText").textContent = linkedSessionCount + " dari " + state.whatsappSessionLimit + " session digunakan";
+    const headerAdd = $("#addWhatsAppSessionButton");
+    if (headerAdd) {
+      headerAdd.classList.toggle("is-session-locked", !canAdd);
+      // [MODIFIED] Keep the plus icon visible; show the crown as a small locked-capacity badge.
+      headerAdd.innerHTML = '<span aria-hidden="true">+</span>';
+      headerAdd.title = canAdd ? "Tambah session WhatsApp" : "Batas session tercapai · Upgrade Premium";
+    }
+    const selected = state.whatsappSessions.find((item) => item.session_id === state.activeSessionId);
+    const deleteButton = $("#whatsappSessionDeleteButton");
+    if (deleteButton) deleteButton.hidden = !selected || Boolean(selected.is_primary);
+    const selectedStatus = selected?.status || selected?.connection_status || "disconnected";
+    const connectButton = $("#whatsappSessionConnectButton");
+    if (connectButton) {
+      connectButton.hidden = selectedStatus === "connected";
+      connectButton.textContent = selectedStatus === "qr" ? "Tampilkan QR" : "Hubungkan session";
+    }
+    // [MODIFIED] The first row always represents the primary account; the checkmark follows the active session.
+    const primary = (state.whatsappSessions || []).find((item) => item.is_primary);
+    const primaryAvatar = $("#accountWhatsAppAvatar");
+    const primaryPhoto = $("#accountWhatsAppPhoto");
+    const primaryName = $("#accountWhatsAppName");
+    const primaryPhone = $("#accountWhatsAppPhone");
+    const primaryState = $("#accountWhatsAppState");
+    // [MODIFIED] Hide the primary row when no valid WhatsApp connection exists.
+    const primaryStatus = primary?.status || primary?.connection_status || "disconnected";
+    const showPrimary = Boolean(primary && ["connected", "paused"].includes(primaryStatus));
+    const primaryRow = $(".whatsapp-primary-account-row");
+    if (primaryRow) primaryRow.classList.toggle("hidden", !showPrimary);
+    const accountControls = $("#whatsappAccountControls");
+    if (accountControls) accountControls.classList.toggle("hidden", !hasVisibleSessions);
+    if (!hasVisibleSessions && accountRows) {
+      accountRows.innerHTML = '<div class="whatsapp-empty-state"><strong>Belum ada WhatsApp terhubung</strong><span>Ketuk tombol + untuk menambahkan akun WhatsApp.</span></div>';
+    }
+    if (primary && showPrimary) {
+      const primaryActive = primary.session_id === state.activeSessionId;
+      primaryAvatar?.classList.toggle("is-selected", primaryActive);
+      if (primaryPhoto) {
+        if (primary.picture_url) {
+          primaryPhoto.src = primary.picture_url;
+          primaryPhoto.classList.remove("hidden");
+        } else {
+          primaryPhoto.removeAttribute("src");
+          primaryPhoto.classList.add("hidden");
+        }
+      }
+      if (primaryName) primaryName.textContent = primary.display_name || primary.label || "WhatsApp";
+      if (primaryPhone) primaryPhone.textContent = primary.phone_number ? "+" + String(primary.phone_number).replace(/^\\+/, "") : "Nomor belum tersedia";
+      if (primaryState) {
+        const status = primary.status || primary.connection_status || "disconnected";
+        primaryState.classList.toggle("is-connected", status === "connected");
+        primaryState.classList.toggle("is-paused", status === "paused");
+        primaryState.innerHTML = status === "connected" ? "<i></i> Connected" : status === "paused" ? "<i></i> Pause" : "<i></i> Connect";
+      }
+    }
+    const primarySettingsSlot = $("#primaryWhatsAppSettingsSlot");
+    if (primarySettingsSlot) {
+      primarySettingsSlot.dataset.accountSettingsSlot = showPrimary ? primary.session_id : "";
+      primarySettingsSlot.classList.toggle("hidden", !showPrimary);
+    }
+    mountWhatsAppSessionSettings();
+  }
+
+  // [ADDED] Place the shared settings content directly below the session that owns it.
+  function mountWhatsAppSessionSettings() {
+    const panel = $("#whatsappAccountControls");
+    if (!panel) return;
+    const hasVisibleSessions = (state.whatsappSessions || []).some((session) =>
+      ["connected", "paused"].includes(session.status || session.connection_status || "disconnected")
+    );
+    panel.hidden = !hasVisibleSessions;
+    if (!hasVisibleSessions) {
+      panel.classList.add("is-collapsed");
+      return;
+    }
+    const sessionId = state.expandedSettingsSessionId;
+    const slot = sessionId
+      ? $("[data-account-settings-slot='" + CSS.escape(sessionId) + "']")
+      : null;
+    if (slot) {
+      slot.appendChild(panel);
+      panel.classList.remove("is-collapsed");
+    } else {
+      panel.classList.add("is-collapsed");
+      const card = $(".whatsapp-account-card");
+      const rows = $("#whatsappAccountRows");
+      if (card && rows) card.appendChild(panel);
+    }
+    document.querySelectorAll("[data-account-settings-toggle]").forEach((button) => {
+      button.setAttribute("aria-expanded", String(button.dataset.accountSettingsToggle === sessionId));
+    });
+    $("#whatsappControlsToggle")?.setAttribute("aria-expanded", String(Boolean(sessionId)));
+  }
+
+  // [ADDED] Load WhatsApp connection details for the selected Profile session.
+  async function loadWhatsAppAccount() {
+    const disconnectButton = $("#disconnectWhatsAppButton");
+    try {
+      await loadWhatsAppSessions();
+      if (!state.activeSessionId) throw new Error("Session WhatsApp belum tersedia.");
+      const data = await api("/sessions/" + enc(state.activeSessionId) + "/connection");
+      // [MODIFIED] Connection actions follow the active session; account identity rows stay fixed.
+      const connected = data.status === "connected";
+      const paused = data.status === "paused";
+      // [MODIFIED] The primary row is rendered from its own account record; selecting another
+      // session must not replace its identity, avatar, or connection status.
+      disconnectButton.disabled = !connected && !paused;
+      disconnectButton.dataset.sessionId = state.activeSessionId;
+    } catch (error) {
+      disconnectButton.disabled = true;
+    }
+  }
+
+  // [ADDED] Countdown until the next automatic Free-tier pause at 08:00 WITA.
+  function renderFreePauseCountdown() {
+    const countdown = $("#accountWhatsAppState .free-pause-countdown");
+    if (!countdown) return;
+    if (!state.membership || state.membership.plan !== "free") {
+      countdown.classList.add("hidden");
+      return;
+    }
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Makassar", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const nextPause = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day), 6, 0, 0));
+    if (Date.now() >= nextPause.getTime()) nextPause.setUTCDate(nextPause.getUTCDate() + 1);
+    const remainingMinutes = Math.max(0, Math.floor((nextPause.getTime() - Date.now()) / 60000));
+    const hours = Math.floor(remainingMinutes / 60);
+    const minutes = remainingMinutes % 60;
+    countdown.textContent = String(hours).padStart(2, "0") + "." + String(minutes).padStart(2, "0");
+    countdown.classList.remove("hidden");
+    countdown.title = "Menuju pause otomatis pukul 14.00 WITA";
+    countdown.setAttribute("aria-label", "Pause otomatis dalam " + hours + " jam " + minutes + " menit");
+  }
+
+  // [ADDED] Persist notification preferences locally on this device.
+  const NOTIFICATION_PREFS_KEY = "wagram-notification-preferences";
+  const DEFAULT_NOTIFICATION_PREFS = {
+    private: true, groups: true, channels: true, calls: true, mentions: true, media: true
+  };
+
+  function isPremiumMembership() {
+    return Boolean(state.membership?.plan && state.membership.plan !== "free");
+  }
+
+  // [ADDED] AI Business is exclusively available to active Premium C (30-day) members.
+  function isAIBusinessEligible() {
+    const membership = state.membership;
+    if (membership?.plan !== "premium-c") return false;
+    if (!membership.plan_expires_at) return true;
+    const expiry = new Date(membership.plan_expires_at).getTime();
+    return Number.isFinite(expiry) && expiry > Date.now();
+  }
+
+  // [ADDED] Update the permanently pinned WAMO AI row with the current access state.
+  function renderWagramAiPinnedRow() {
+    const eligible = isAIBusinessEligible();
+    const planLabel = $("#wagramAiPlanLabel");
+    const accessLabel = $("#wagramAiAccessLabel");
+    const lock = $("#wagramAiLockIndicator");
+    const row = $("#wagramAiPinnedRow");
+    if (!row) return;
+    if (planLabel) planLabel.textContent = eligible ? "AI Business" : "Premium C";
+    if (accessLabel) accessLabel.textContent = eligible
+      ? "Asisten bisnis, stok, dan laporan usaha"
+      : "Khusus pelanggan Premium C · 30 hari";
+    if (lock) lock.classList.toggle("hidden", eligible);
+    row.classList.toggle("is-premium-locked", !eligible);
+  }
+
+  function isPremiumNotification(key) {
+    return ["groups", "channels", "mentions", "media"].includes(key);
+  }
+
+  function renderNotificationPreferences() {
+    let allSaved = {};
+    try {
+      allSaved = JSON.parse(localStorage.getItem(NOTIFICATION_PREFS_KEY) || "{}");
+    } catch {
+      allSaved = {};
+    }
+    const settingsSessionId = state.expandedSettingsSessionId || state.activeSessionId;
+    const saved = allSaved[settingsSessionId] || {};
+    const premium = isPremiumMembership();
+    document.querySelectorAll("[data-notification]").forEach((button) => {
+      const key = button.dataset.notification;
+      button.dataset.sessionId = settingsSessionId || "";
+      const locked = !premium && isPremiumNotification(key);
+      const enabled = !locked && (
+        typeof saved[key] === "boolean" ? saved[key] : DEFAULT_NOTIFICATION_PREFS[key]
+      );
+      const option = button.closest(".notification-option");
+      button.setAttribute("aria-checked", String(enabled));
+      button.setAttribute("aria-disabled", String(locked));
+      button.classList.toggle("is-premium-locked", locked);
+      option?.classList.toggle("is-premium-locked", locked);
+      button.setAttribute(
+        "aria-label",
+        locked ? `${option?.querySelector(".notification-option-copy strong")?.textContent || key}, khusus Premium` : key
+      );
+      let crown = button.querySelector(".notification-lock-crown");
+      if (locked && !crown) {
+        crown = document.createElement("span");
+        crown.className = "notification-lock-crown";
+        crown.setAttribute("aria-hidden", "true");
+        crown.innerHTML = '<img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="">';
+        button.appendChild(crown);
+      } else if (!locked && crown) {
+        crown.remove();
+      }
+    });
+
+    // [ADDED] Keep the AI Business switch synchronized with the current Premium session.
+    renderAIBusinessToggle();
+  }
+
+  // [ADDED] Resolve the WhatsApp session controlled by the Profile Auto Reply switch.
+  function getAIBusinessToggleSessionId() {
+    return String(state.expandedSettingsSessionId || state.activeSessionId || "");
+  }
+
+  // [ADDED] Load the persistent Auto Reply preference for the selected WhatsApp session.
+  async function loadAIBusinessAutoReplyPreference(sessionId) {
+    if (!sessionId || state.aiBusinessAutoReplyLoadingSessionId === sessionId) return;
+    state.aiBusinessAutoReplyLoadingSessionId = sessionId;
+    try {
+      const data = await api("/ai-business/auto-reply", {
+        headers: { "X-WAGRAM-Session-ID": sessionId }
+      });
+      if (getAIBusinessToggleSessionId() === sessionId) {
+        state.aiBusinessAutoReplyEnabled = data.enabled === true;
+        state.aiBusinessAutoReplySessionId = sessionId;
+        renderAIBusinessToggle();
+      }
+    } catch (error) {
+      console.error("Could not load WAGRAM AI Auto Reply preference:", error);
+    } finally {
+      if (state.aiBusinessAutoReplyLoadingSessionId === sessionId) {
+        state.aiBusinessAutoReplyLoadingSessionId = null;
+      }
+    }
+  }
+
+  // [MODIFIED] Reflect Premium access and the server-backed Auto Reply state in Profile.
+  function renderAIBusinessToggle() {
+    const button = $("#aiBusinessToggle");
+    const description = $("#aiBusinessSettingDescription");
+    const option = $("#aiBusinessSettingOption");
+    if (!button) return;
+
+    const premium = isAIBusinessEligible();
+    const sessionId = getAIBusinessToggleSessionId();
+    const hasLoadedPreference = Boolean(sessionId) && state.aiBusinessAutoReplySessionId === sessionId;
+    const enabled = premium && hasLoadedPreference && state.aiBusinessAutoReplyEnabled === true;
+
+    button.setAttribute("aria-checked", String(enabled));
+    button.setAttribute("aria-disabled", String(!premium || !sessionId));
+    button.disabled = !premium || !sessionId;
+    option?.classList.toggle("is-premium-locked", !premium);
+    option?.classList.toggle("is-ai-business-enabled", enabled);
+
+    if (description) {
+      description.textContent = !premium
+        ? "Khusus Premium C (30 hari)"
+        : !sessionId
+          ? "Pilih session WhatsApp terlebih dahulu"
+          : enabled
+            ? "Auto Reply WhatsApp aktif untuk session ini"
+            : "Auto Reply WhatsApp nonaktif";
+    }
+
+    if (premium && sessionId && !hasLoadedPreference) {
+      loadAIBusinessAutoReplyPreference(sessionId);
+    }
+  }
+
+  // [MODIFIED] Toggle only automatic WhatsApp replies; WAMO AI remains available.
+  async function toggleAIBusinessPreference() {
+    if (!isAIBusinessEligible()) {
+      openPremiumSheet();
+      return;
+    }
+
+    const button = $("#aiBusinessToggle");
+    const sessionId = getAIBusinessToggleSessionId();
+    if (!button || !sessionId || button.disabled) return;
+
+    const enabled = button.getAttribute("aria-checked") !== "true";
+    button.disabled = true;
+
+    try {
+      const data = await api("/ai-business/auto-reply", {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
+        headers: { "X-WAGRAM-Session-ID": sessionId }
+      });
+      state.aiBusinessAutoReplyEnabled = data.enabled === true;
+      state.aiBusinessAutoReplySessionId = sessionId;
+      renderAIBusinessToggle();
+      showToast(data.enabled
+        ? "Auto Reply WhatsApp diaktifkan."
+        : "Auto Reply WhatsApp dinonaktifkan. WAMO AI tetap aktif.");
+    } catch (error) {
+      showToast(error.message || "Pengaturan Auto Reply gagal disimpan.");
+      renderAIBusinessToggle();
+    }
+  }
+
+  function toggleNotificationPreference(button) {
+    const key = button.dataset.notification;
+    if (!Object.prototype.hasOwnProperty.call(DEFAULT_NOTIFICATION_PREFS, key)) return;
+    if (!isPremiumMembership() && isPremiumNotification(key)) return;
+    const enabled = button.getAttribute("aria-checked") !== "true";
+    let allSaved = {};
+    try {
+      allSaved = JSON.parse(localStorage.getItem(NOTIFICATION_PREFS_KEY) || "{}");
+    } catch {
+      allSaved = {};
+    }
+    const sessionId = button.dataset.sessionId || state.activeSessionId;
+    if (!sessionId) return;
+    const saved = allSaved[sessionId] || {};
+    saved[key] = enabled;
+    allSaved[sessionId] = saved;
+    try {
+      localStorage.setItem(NOTIFICATION_PREFS_KEY, JSON.stringify(allSaved));
+    } catch {
+      showToast("Pengaturan tidak dapat disimpan di perangkat ini.");
+    }
+    button.setAttribute("aria-checked", String(enabled));
+  }
+
+  /* ---------------------------------------------------------
+     Chat
+     --------------------------------------------------------- */
+
+  async function loadChats() {
+    const list = $("#chatList");
+
+    if (!state.chatsLoaded) {
+      list.innerHTML = '<div class="loading">Memuat percakapan…</div>';
+    }
+
+    try {
+      // [MODIFIED] Fetch active and archived chats together so every filter count stays accurate.
+      const [activeData, archivedData] = await Promise.all([
+        api("/chats?limit=100&archived=false"),
+        api("/chats?limit=100&archived=true")
+      ]);
+      const activeChats = activeData.chats || [];
+      const archivedChats = archivedData.chats || [];
+
+      state.chatCounts = {
+        all: activeChats.length,
+        unread: activeChats.filter((chat) => Number(chat.unread_count) > 0).length,
+        favorites: activeChats.filter((chat) => Boolean(chat.is_favorite)).length,
+        archived: archivedChats.length
+      };
+      state.chats = state.filter === "archived" ? archivedChats : activeChats;
+      state.chatsLoaded = true;
+      updateChatFilterCounts();
+      updateBottomNavBadges();
+      renderChats();
+    } catch (error) {
+      state.chatsLoaded = false;
+      list.innerHTML = errorState(error.message, "retryChats");
+      $("#retryChats")?.addEventListener("click", loadChats);
+    }
+  }
+
+  // [ADDED] Keep the count badges on chat filters synchronized with server data.
+  function updateChatFilterCounts() {
+    const counts = state.chatCounts;
+    updateBottomNavBadges();
+    const labels = {
+      all: "Semua",
+      unread: "Belum dibaca",
+      favorites: "Favorit",
+      archived: "Arsip"
+    };
+
+    Object.entries(labels).forEach(([filter, label]) => {
+      const button = document.querySelector(`#chatFilters [data-filter="${filter}"]`);
+      if (!button) return;
+      button.innerHTML = `${label}<span class="chip-count">${counts[filter] || 0}</span>`;
+    });
+  }
+
+  function chatName(chat) {
+    return chat.display_name || chat.name || formatPhone(chat.phone_number) || chat.whatsapp_chat_id;
+  }
+
+  // [ADDED] Free accounts cannot open WhatsApp groups or channels.
+  function isPremiumLockedChat(chat) {
+    const jid = String(chat?.whatsapp_chat_id || "");
+    return chat?.chat_type === "group" || jid.endsWith("@newsletter");
+  }
+
+  function renderChats() {
+    const list = $("#chatList");
+    const query = state.search.trim().toLowerCase();
+
+    let items = state.chats.filter((chat) => {
+      if (state.filter === "unread" && !(chat.unread_count > 0)) return false;
+      if (state.filter === "favorites" && !chat.is_favorite) return false;
+
+      if (!query) return true;
+
+      return [chatName(chat), chat.phone_number, chat.last_message_preview]
+        .join(" ")
+        .toLowerCase()
+        .includes(query);
+    });
+
+    // [MODIFIED] The duplicate conversation heading and count were removed from the page.
+    // Filter totals are displayed directly in the filter chips.
+    const hits = query.length >= 2 ? state.messageHits : [];
+
+    if (!items.length && !hits.length) {
+      list.innerHTML = (query
+        ? emptyState("search", "Tidak ada hasil", "Coba kata kunci lain.")
+        : emptyState(
+            "chat",
+            "Belum ada percakapan",
+            state.filter === "all"
+              ? "Pesan WhatsApp yang masuk akan muncul di sini."
+              : "Tidak ada chat pada filter ini."
+          ));
+      return;
+    }
+
+    const chatRows = items.map((chat) => {
+      const name = chatName(chat);
+      const unread = Number(chat.unread_count) || 0;
+      const isGroup = chat.chat_type === "group";
+      const isLocked = !isPremiumMembership() && isPremiumLockedChat(chat);
+
+      return `
+        <div class="chat-swipe-row ${isLocked ? "is-premium-locked" : ""}" data-chat-row="${escapeHTML(chat.whatsapp_chat_id)}">
+          <div class="chat-actions">
+            <button class="chat-favorite-action" type="button" data-favorite-chat="${escapeHTML(chat.whatsapp_chat_id)}" aria-label="${chat.is_favorite ? "Hapus dari favorit" : "Tambahkan ke favorit"}">
+              ${icon("star")}
+            </button>
+            <button class="chat-archive-action" type="button" data-archive-chat="${escapeHTML(chat.whatsapp_chat_id)}" aria-label="Arsipkan chat">
+              ${icon("archive")}
+            </button>
+          </div>
+          <button class="list-item chat-row-content" type="button" data-chat="${escapeHTML(chat.whatsapp_chat_id)}" ${isLocked ? 'data-premium-chat="true"' : ""}>
+            <span class="chat-avatar-wrap">
+              ${avatar(name, name, "", chat.profile_picture_url)}
+              ${isLocked ? '<span class="premium-chat-crown" aria-label="Premium"><img class="premium-crown-svg" src="./assets/premium-crown.svg" alt=""></span>' : ""}
+            </span>
+            <div class="item-body">
+              <div class="item-row">
+                <span class="item-title">${escapeHTML(name)}</span>
+                <span class="item-time ${unread ? "is-unread" : ""}">${escapeHTML(formatListTime(chat.last_message_at))}</span>
+              </div>
+              <div class="item-row">
+                <span class="item-sub">${isLocked ? (chat.chat_type === "group" ? "Grup · Premium" : "Saluran · Premium") : escapeHTML(chat.last_message_preview || (isGroup ? "Grup" : "Belum ada pesan"))}</span>
+                ${chat.is_favorite || unread
+                  ? `<span class="item-flags">${chat.is_favorite ? icon("star", "mini-icon fav") : ""}${unread ? `<span class="badge">${unread > 99 ? "99+" : unread}</span>` : ""}</span>`
+                  : ""}
+              </div>
+            </div>
+          </button>
+        </div>`;
+    }).join("");
+
+    const hitRows = hits.length
+      ? `<div class="sub-heading">Pesan</div>` + hits.map((hit) => {
+          const name = hit.chat_name || hit.sender_name || "Chat";
+          const hitChat = state.chats.find((chat) => chat.whatsapp_chat_id === hit.whatsapp_chat_id);
+          const isLocked = !isPremiumMembership() && isPremiumLockedChat(hitChat || { whatsapp_chat_id: hit.whatsapp_chat_id });
+
+          return `
+            <button class="list-item ${isLocked ? "is-premium-locked" : ""}" type="button" data-chat="${escapeHTML(hit.whatsapp_chat_id)}" ${isLocked ? 'data-premium-chat="true"' : ""}>
+              ${avatar(name, name, "small")}
+              <div class="item-body">
+                <div class="item-row">
+                  <span class="item-title">${escapeHTML(name)}</span>
+                  <span class="item-time">${escapeHTML(formatListTime(hit.message_timestamp))}</span>
+                </div>
+                <div class="item-row">
+                  <span class="item-sub">${escapeHTML(hit.body || "")}</span>
+                </div>
+              </div>
+            </button>`;
+        }).join("")
+      : "";
+
+    list.innerHTML = chatRows + hitRows;
+  }
+
+  let searchTimer = 0;
+  let searchSeq = 0;
+
+  function onChatSearch(event) {
+    state.search = event.target.value;
+
+    const query = state.search.trim();
+
+    clearTimeout(searchTimer);
+
+    if (query.length < 2) {
+      state.messageHits = [];
+      renderChats();
+      return;
+    }
+
+    renderChats();
+
+    searchTimer = setTimeout(async () => {
+      const seq = ++searchSeq;
+
+      try {
+        const data = await api(`/search?q=${enc(query)}`);
+
+        if (seq !== searchSeq) return;
+
+        state.messageHits = data.messages || [];
+        renderChats();
+      } catch {
+        /* pencarian pesan bersifat tambahan */
+      }
+    }, 350);
+  }
+
+  function mediaLabel(message) {
+    const label = MEDIA_LABELS[message.message_type] || `[${message.message_type || "pesan"}]`;
+
+    return message.media_file_name ? `${label} · ${message.media_file_name}` : label;
+  }
+
+  async function openChat(chatId) {
+    const requestedChat = state.chats.find((chat) => chat.whatsapp_chat_id === chatId);
+    if (!isPremiumMembership() && isPremiumLockedChat(requestedChat || { whatsapp_chat_id: chatId })) {
+      openPremiumSheet();
+      return;
+    }
+
+    clearMediaCache();
+
+    const known = state.chats.find((chat) => chat.whatsapp_chat_id === chatId);
+
+    state.currentChat = known || { whatsapp_chat_id: chatId };
+
+    $(PAGES.chats).classList.add("hidden");
+    $("#conversationPage").classList.remove("hidden");
+    $("#topbar").classList.add("hidden");
+    document.body.classList.add("in-chat");
+
+    try {
+      tg?.BackButton?.show();
+    } catch {
+      /* tidak penting */
+    }
+
+    updateConversationHeader();
+
+    const messageList = $("#messageList");
+
+    messageList.innerHTML = '<div class="loading">Memuat pesan…</div>';
+
+    try {
+      const data = await api(`/chats/${enc(chatId)}/messages?limit=200`);
+
+      if (state.currentChat?.whatsapp_chat_id !== chatId) return;
+
+      state.currentChat = { ...state.currentChat, ...data.chat };
+      updateConversationHeader();
+      renderMessages(data.messages || []);
+      state.currentChatMessageSignature = getMessageSignature(data.messages || []);
+
+      // [MODIFIED] Wait until the local read status is saved before refreshing unread badges.
+      try {
+        await api(`/chats/${enc(chatId)}/read`, { method: "POST" });
+      } catch (readError) {
+        console.warn("Could not mark chat as read in Mini App:", readError.message);
+      }
+
+      // [MODIFIED] Clear the unread count immediately in the current UI.
+      const openedChat = state.chats.find(
+        (chat) => chat.whatsapp_chat_id === chatId
+      );
+
+      if (openedChat) {
+        openedChat.unread_count = 0;
+      }
+
+      state.chatCounts.unread = state.chats.filter(
+        (chat) => Number(chat.unread_count) > 0
+      ).length;
+
+      updateChatFilterCounts();
+      renderChats();
+      updateBottomNavBadges();
+    } catch (error) {
+      messageList.innerHTML = errorState(error.message, "retryMessages");
+      $("#retryMessages")?.addEventListener("click", () => openChat(chatId));
+    }
+  }
+
+  function updateConversationHeader() {
+    const chat = state.currentChat;
+
+    if (!chat) return;
+
+    const name = chatName(chat);
+    const isGroup = chat.chat_type === "group";
+
+    $("#conversationName").textContent = name;
+    $("#conversationSubtitle").textContent = isGroup
+      ? "Grup"
+      : formatPhone(chat.phone_number) || "Chat pribadi";
+
+    const conversationAvatar = $("#conversationAvatar");
+    conversationAvatar.innerHTML = chat.profile_picture_url
+      ? `<img class="avatar-photo" src="${escapeHTML(chat.profile_picture_url)}" alt="" referrerpolicy="no-referrer">`
+      : escapeHTML(getInitials(name));
+    conversationAvatar.style.setProperty("--h", avatarHue(name));
+    conversationAvatar.dataset.profileJid = chat.whatsapp_chat_id || "";
+    conversationAvatar.dataset.profileName = name;
+    $("#conversationName").dataset.profileJid = chat.whatsapp_chat_id || "";
+    $("#conversationName").dataset.profileName = name;
+
+    // [MODIFIED] Enable contact and WhatsApp actions only when a phone number is available.
+    const hasPhone = Boolean(String(chat.phone_number || "").replace(/\D/g, ""));
+    $("#saveChatContactButton").disabled = !hasPhone;
+    $("#openChatWhatsAppButton").disabled = !hasPhone;
+  }
+
+  /* ---------------------------------------------------------
+     Foto & video
+     --------------------------------------------------------- */
+
+  const MEDIA_ERRORS = {
+    MEDIA_TOO_LARGE: "File terlalu besar untuk ditampilkan di sini (lebih dari 20 MB).",
+    MEDIA_NOT_FOUND: "File tidak ditemukan.",
+    MEDIA_UNAVAILABLE: "File tidak dapat dimuat saat ini."
+  };
+
+  const mediaCache = new Map();
+  let mediaObserver = null;
+  let nearBottom = true;
+
+  function clearMediaCache() {
+    mediaObserver?.disconnect();
+    mediaObserver = null;
+
+    for (const url of mediaCache.values()) {
+      URL.revokeObjectURL(url);
+    }
+
+    mediaCache.clear();
+  }
+
+  // Berkas diminta dengan header autentikasi lalu dijadikan blob lokal.
+  async function fetchMediaURL(messageId) {
+    const key = String(messageId);
+
+    if (mediaCache.has(key)) return mediaCache.get(key);
+
+    let response;
+
+    try {
+      response = await fetch(`${API_BASE}/messages/${enc(key)}/media`, {
+        headers: {
+          "X-Telegram-Init-Data": tg?.initData || "",
+          // [MODIFIED] Media requests must use the same WhatsApp session as the active chat.
+          ...(state.activeSessionId ? { "X-WAGRAM-Session-ID": state.activeSessionId } : {})
+        }
+      });
+    } catch {
+      throw new Error("Tidak dapat terhubung ke server.");
+    }
+
+    if (!response.ok) {
+      let code = "";
+
+      try {
+        code = (await response.json()).error;
+      } catch {
+        /* respons bukan JSON */
+      }
+
+      throw new Error(MEDIA_ERRORS[code] || MEDIA_ERRORS.MEDIA_UNAVAILABLE);
+    }
+
+    const url = URL.createObjectURL(await response.blob());
+
+    mediaCache.set(key, url);
+
+    return url;
+  }
+
+  // [ADDED] Compact Premium placeholder for incoming media on Free accounts.
+  function lockedMediaHTML(message) {
+    const kind = message.media_kind || message.message_type;
+    const labels = {
+      photo: "foto",
+      image: "foto",
+      video: "video",
+      animation: "GIF",
+      sticker: "stiker",
+      audio: "audio",
+      ptt: "pesan suara",
+      document: "dokumen",
+      location: "lokasi",
+      contact: "kontak",
+      view_once: "media sekali lihat"
+    };
+    const label = labels[kind] || "media";
+    const sender = message.direction === "outgoing"
+      ? "Anda"
+      : message.contact_name || message.sender_name || chatName(state.currentChat || {});
+    const iconName = ["photo", "image"].includes(kind) ? "file"
+      : ["video", "animation"].includes(kind) ? "video"
+        : ["audio", "ptt"].includes(kind) ? "play"
+          : kind === "sticker" ? "star" : "file";
+
+    return `<div class="locked-media">
+      <div class="locked-media-heading">${icon(iconName)}<strong>${escapeHTML(label.charAt(0).toUpperCase() + label.slice(1))}</strong><span class="locked-media-lock">${icon("eye-off")}</span></div>
+      <div class="locked-media-copy">${escapeHTML(sender)} mengirim ${escapeHTML(label)}</div>
+      <button class="locked-media-upgrade" type="button" data-premium-media="true"><img class="premium-crown-svg" src="./assets/premium-crown.svg" alt="" aria-hidden="true"> Upgrade untuk melihat</button>
+    </div>`;
+  }
+
+  function mediaHTML(message) {
+    const kind = message.media_kind || message.message_type;
+    const mime = String(message.media_mimetype || "").toLowerCase();
+    const fileName = escapeHTML(message.media_file_name || "Dokumen");
+    const isSticker = kind === "sticker";
+    const isImage =
+      kind === "photo" ||
+      kind === "image" ||
+      isSticker ||
+      (kind === "document" && mime.startsWith("image/"));
+
+    if (isImage) {
+      return `<div class="media ${isSticker ? "sticker" : ""}"><img class="media-img is-loading" alt="${isSticker ? "Stiker" : "Foto"}" data-media-img="${escapeHTML(message.id)}"></div>`;
+    }
+
+    if (kind === "video" || kind === "animation") {
+      const isGif = kind === "animation";
+      return `<button class="media video-card" type="button" data-media-video="${escapeHTML(message.id)}" data-gif="${isGif ? 1 : 0}">${icon("play")}<span>${isGif ? "Putar GIF" : "Putar video"}</span></button>`;
+    }
+
+    if (kind === "audio" || kind === "ptt") {
+      const isVoice = /voice|ogg/i.test(message.media_file_name || mime);
+      return `<button class="media audio-card" type="button" data-media-audio="${escapeHTML(message.id)}">${icon("play")}<span>${isVoice ? "Putar pesan suara" : "Putar audio"}</span></button>`;
+    }
+
+    if (kind === "document" || message.media_file_name) {
+      const isPdf = mime === "application/pdf";
+      return `<button class="media document-card" type="button" data-media-document="${escapeHTML(message.id)}" data-file-name="${fileName}" data-open-inline="${isPdf ? 1 : 0}">${icon("file")}<span><strong>${fileName}</strong><small>${isPdf ? "PDF · Buka dokumen" : "Dokumen · Unduh file"}</small></span></button>`;
+    }
+
+    return "";
+  }
+
+  function keepBottom() {
+    const list = $("#messageList");
+
+    if (nearBottom) list.scrollTop = list.scrollHeight;
+  }
+
+  async function loadImage(img) {
+    try {
+      const url = await fetchMediaURL(img.dataset.mediaImg);
+
+      img.addEventListener("load", keepBottom, { once: true });
+      img.src = url;
+      img.classList.remove("is-loading");
+    } catch (error) {
+      img.closest(".media")?.replaceWith(
+        Object.assign(document.createElement("div"), {
+          className: "media media-error",
+          textContent: error.message
+        })
+      );
+    }
+  }
+
+  // Foto dimuat saat mendekati layar supaya hemat data.
+  function observeMedia(root) {
+    mediaObserver?.disconnect();
+
+    const images = root.querySelectorAll("[data-media-img]");
+
+    if (!("IntersectionObserver" in window)) {
+      images.forEach(loadImage);
+      return;
+    }
+
+    mediaObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+
+        mediaObserver.unobserve(entry.target);
+        loadImage(entry.target);
+      }
+    }, { root, rootMargin: "300px" });
+
+    images.forEach((img) => mediaObserver.observe(img));
+  }
+
+  async function playVideo(button) {
+    if (button.dataset.busy) return;
+
+    button.dataset.busy = "1";
+
+    const label = button.querySelector("span");
+    const original = label.textContent;
+
+    label.textContent = "Memuat…";
+
+    try {
+      const url = await fetchMediaURL(button.dataset.mediaVideo);
+      const isGif = button.dataset.gif === "1";
+      const video = document.createElement("video");
+
+      video.className = "media-video";
+      video.src = url;
+      video.controls = !isGif;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.loop = isGif;
+      video.muted = isGif;
+      video.addEventListener("loadedmetadata", keepBottom, { once: true });
+
+      button.replaceWith(video);
+      video.play?.().catch(() => {});
+    } catch (error) {
+      label.textContent = original;
+      delete button.dataset.busy;
+      showToast(error.message);
+    }
+  }
+
+  // [ADDED] Load audio from the authenticated media endpoint on demand.
+  async function playAudio(button) {
+    if (button.dataset.busy) return;
+    button.dataset.busy = "1";
+    const label = button.querySelector("span");
+    const original = label.textContent;
+    label.textContent = "Memuat audio…";
+
+    try {
+      const url = await fetchMediaURL(button.dataset.mediaAudio);
+      const audio = document.createElement("audio");
+      audio.className = "media-audio";
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.src = url;
+      button.replaceWith(audio);
+      await audio.play().catch(() => {});
+    } catch (error) {
+      label.textContent = original;
+      delete button.dataset.busy;
+      showToast(error.message);
+    }
+  }
+
+  // [ADDED] Open PDFs in the browser and download other document types.
+  async function openDocument(button) {
+    if (button.dataset.busy) return;
+    button.dataset.busy = "1";
+    const label = button.querySelector("small");
+    const original = label.textContent;
+    label.textContent = "Menyiapkan dokumen…";
+
+    const popup = button.dataset.openInline === "1"
+      ? window.open("about:blank", "_blank")
+      : null;
+
+    try {
+      const url = await fetchMediaURL(button.dataset.mediaDocument);
+      if (button.dataset.openInline === "1") {
+        if (popup) {
+          popup.location.href = url;
+        } else {
+          showToast("Izinkan pop-up untuk membuka PDF.");
+        }
+      } else {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = button.dataset.fileName || "document";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      }
+      label.textContent = original;
+      delete button.dataset.busy;
+    } catch (error) {
+      popup?.close();
+      label.textContent = original;
+      delete button.dataset.busy;
+      showToast(error.message);
+    }
+  }
+
+  function openLightbox(src) {
+    $("#lightboxImage").src = src;
+    $("#lightbox").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+
+    try {
+      tg?.BackButton?.show();
+    } catch {
+      /* tidak penting */
+    }
+  }
+
+  function closeLightbox() {
+    $("#lightbox").classList.add("hidden");
+    $("#lightboxImage").removeAttribute("src");
+    document.body.style.overflow = "";
+  }
+
+  function renderMessages(messages, options = {}) {
+    const list = $("#messageList");
+    const previousDistanceFromBottom =
+      list.scrollHeight - list.scrollTop - list.clientHeight;
+    const shouldStickToBottom = options.preservePosition
+      ? previousDistanceFromBottom < 200
+      : true;
+
+    if (!messages.length) {
+      list.innerHTML = emptyState("chat", "Belum ada pesan", "Riwayat pesan akan muncul di sini.");
+      return;
+    }
+
+    const isGroup = state.currentChat?.chat_type === "group";
+    let lastDay = "";
+
+    list.innerHTML = messages.map((message) => {
+      const ms = toMs(message.message_timestamp);
+      const day = ms ? startOfDay(ms) : 0;
+      const outgoing = message.direction === "outgoing";
+      const deleted = Boolean(Number(message.is_deleted));
+      const edited = Boolean(Number(message.is_edited));
+      // [ADDED] View Once messages are represented without exposing or downloading their media.
+      const viewOnce = message.message_type === "view_once";
+
+      let separator = "";
+
+      if (day && String(day) !== lastDay) {
+        lastDay = String(day);
+        separator = `<div class="day-label">${escapeHTML(dayLabel(ms))}</div>`;
+      }
+
+      // Nama dari Kontak diutamakan dibanding nama profil WhatsApp.
+      const senderName = message.contact_name || message.sender_name;
+
+      const sender = isGroup && !outgoing && senderName
+        ? (message.sender_jid
+          ? `<button class="message-sender profile-sender" type="button" data-profile-jid="${escapeHTML(message.sender_jid)}" data-profile-name="${escapeHTML(senderName)}">${escapeHTML(senderName)}</button>`
+          : `<div class="message-sender">${escapeHTML(senderName)}</div>`)
+        : "";
+
+      const lockedMedia = Boolean(message.media_locked && !deleted && !viewOnce);
+      const media = lockedMedia
+        ? lockedMediaHTML(message)
+        : message.has_media ? mediaHTML(message) : "";
+
+      // [MODIFIED] Hide captions together with locked incoming media for Free accounts.
+      const body = viewOnce
+        ? `<div class="view-once-content"><span class="view-once-symbol" aria-hidden="true">◉</span><div class="view-once-copy"><strong>Media Sekali Lihat</strong><span>Kontak mengirim media yang hanya dapat dilihat satu kali. Silakan buka WhatsApp untuk melihatnya.</span></div><button class="view-once-action" type="button" data-view-once-open="true">Buka WhatsApp</button></div>`
+        : lockedMedia
+          ? ""
+          : message.body
+            ? `<div class="message-text">${escapeHTML(message.body)}</div>`
+            : media
+              ? ""
+              : `<div class="message-text"><span class="message-media">${escapeHTML(mediaLabel(message))}</span></div>`;
+
+      const deletedLabel = deleted
+        ? '<div class="message-status">Pesan dihapus</div>'
+        : "";
+      const editedLabel = edited && !deleted
+        ? '<span class="message-edited">diedit</span>'
+        : "";
+      const originalBubble = edited && !deleted && message.original_body != null
+        ? `<div class="message original-version ${outgoing ? "outgoing" : ""}"><div class="message-text">${escapeHTML(message.original_body)}</div><div class="message-meta">Pesan sebelumnya</div></div><div class="edit-connector" aria-hidden="true"><span></span></div>`
+        : "";
+      const currentBubble = `<div class="message ${outgoing ? "outgoing" : ""} ${media ? "has-media" : ""} ${deleted ? "deleted" : ""} ${edited && !deleted ? "edited" : ""} ${viewOnce ? "view-once" : ""}">${sender}${deletedLabel}${viewOnce ? "" : media}${body}<div class="message-meta">${ms ? escapeHTML(timeOnly(ms)) : ""} ${editedLabel}</div></div>`;
+
+      if (originalBubble) {
+        return `${separator}<div class="message-history-group ${outgoing ? "outgoing" : ""}" data-edit-expandable="true">${originalBubble}${currentBubble}</div>`;
+      }
+
+      return `${separator}${currentBubble}`;
+    }).join("");
+
+    if (shouldStickToBottom) {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      list.scrollTop = Math.max(
+        0,
+        list.scrollHeight - list.clientHeight - previousDistanceFromBottom
+      );
+    }
+    nearBottom = shouldStickToBottom;
+    observeMedia(list);
+  }
+
+  /* ---------------------------------------------------------
+     Profil WhatsApp
+     --------------------------------------------------------- */
+
+  function profilePhone(jid) {
+    const match = String(jid || "").match(/^(\d+)(?::\d+)?@s\.whatsapp\.net$/);
+    return match ? formatPhone(match[1]) : "";
+  }
+
+  function openProfileSheet() {
+    $("#profileSheet").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+    try {
+      tg?.BackButton?.show();
+    } catch {
+      /* tidak penting */
+    }
+  }
+
+  function closeProfileSheet() {
+    $("#profileSheet").classList.add("hidden");
+    $("#profilePhoto").removeAttribute("src");
+    document.body.style.overflow = "";
+    if (
+      $("#contactSheet").classList.contains("hidden") &&
+      !document.body.classList.contains("in-chat")
+    ) {
+      try {
+        tg?.BackButton?.hide();
+      } catch {
+        /* tidak penting */
+      }
+    }
+  }
+
+  async function openProfile(jid, fallbackName = "", fallbackPhone = "") {
+    if (!jid) return;
+
+    const title = $("#profileDisplayName");
+    const about = $("#profileAbout");
+    const phone = $("#profilePhone");
+    const identifier = $("#profileIdentifier");
+    const photo = $("#profilePhoto");
+    const avatarFallback = $("#profileAvatarFallback");
+
+    title.textContent = fallbackName || "Profil WhatsApp";
+    about.textContent = "Memuat info…";
+    phone.textContent = formatPhone(fallbackPhone) || "Memuat…";
+    identifier.textContent = jid;
+    photo.classList.add("hidden");
+    avatarFallback.classList.remove("hidden");
+    avatarFallback.textContent = getInitials(fallbackName || jid);
+    avatarFallback.style.setProperty("--h", avatarHue(fallbackName || jid));
+    $("#profileUpdated").textContent = "";
+    openProfileSheet();
+
+    try {
+      const data = await api(`/profile/${enc(jid)}`);
+      const profile = data.profile || {};
+      const name = profile.displayName || fallbackName || "Pengguna WhatsApp";
+
+      title.textContent = name;
+      about.textContent = profile.about || "Info tidak tersedia atau disembunyikan.";
+      phone.textContent = formatPhone(profile.phoneNumber) || formatPhone(fallbackPhone) || profilePhone(jid) || (
+        jid.endsWith("@g.us") ? "Grup WhatsApp" : "Nomor tidak tersedia"
+      );
+      identifier.textContent = jid;
+
+      if (profile.pictureUrl) {
+        // [ADDED] Reuse the fetched profile photo in chat list and conversation header.
+        if (state.currentChat?.whatsapp_chat_id === jid) {
+          state.currentChat.profile_picture_url = profile.pictureUrl;
+          updateConversationHeader();
+        }
+        const listedChat = state.chats.find((chat) => chat.whatsapp_chat_id === jid);
+        if (listedChat) {
+          listedChat.profile_picture_url = profile.pictureUrl;
+          renderChats();
+        }
+
+        photo.onload = () => {
+          photo.classList.remove("hidden");
+          avatarFallback.classList.add("hidden");
+        };
+        photo.onerror = () => {
+          photo.classList.add("hidden");
+          avatarFallback.classList.remove("hidden");
+        };
+        photo.src = profile.pictureUrl;
+      }
+
+      if (profile.cachedAt) {
+        const date = new Date(profile.cachedAt);
+        $("#profileUpdated").textContent = `Diperbarui ${date.toLocaleString("id-ID", {
+          day: "numeric",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit"
+        })}${profile.stale ? " · cache lama" : ""}`;
+      }
+    } catch (error) {
+      about.textContent = error.message;
+      phone.textContent = formatPhone(fallbackPhone) || profilePhone(jid) || "Tidak tersedia";
+      identifier.textContent = jid;
+      showToast(error.message);
+    }
+  }
+
+  function patchListedChat(chat, changes) {
+    const listed = state.chats.find(
+      (item) => item.whatsapp_chat_id === chat.whatsapp_chat_id
+    );
+
+    if (listed) Object.assign(listed, changes);
+  }
+
+  async function toggleFavorite() {
+    const chat = state.currentChat;
+
+    if (!chat) return;
+
+    const next = !chat.is_favorite;
+
+    try {
+      await api(`/chats/${enc(chat.whatsapp_chat_id)}/favorite`, {
+        method: "PUT",
+        body: JSON.stringify({ favorite: next })
+      });
+
+      chat.is_favorite = next ? 1 : 0;
+      patchListedChat(chat, { is_favorite: chat.is_favorite });
+      updateConversationHeader();
+      showToast(next ? "Ditambahkan ke favorit" : "Dihapus dari favorit");
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  async function toggleArchive() {
+    const chat = state.currentChat;
+
+    if (!chat) return;
+
+    const next = !chat.is_archived;
+
+    try {
+      await api(`/chats/${enc(chat.whatsapp_chat_id)}/archive`, {
+        method: "PUT",
+        body: JSON.stringify({ archived: next })
+      });
+
+      showToast(next ? "Chat diarsipkan" : "Chat dikeluarkan dari arsip");
+      setPage("chats");
+      loadChats();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  // [ADDED] Archive a chat directly from its swipe action in the chat list.
+  async function archiveChatFromList(chatId, button) {
+    const chat = state.chats.find((item) => String(item.whatsapp_chat_id) === String(chatId));
+    if (!chat || button.disabled) return;
+
+    button.disabled = true;
+    try {
+      await api(`/chats/${enc(chatId)}/archive`, {
+        method: "PUT",
+        body: JSON.stringify({ archived: true })
+      });
+
+      chat.is_archived = 1;
+      showToast("Chat berhasil diarsipkan");
+      await loadChats();
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message);
+    }
+  }
+
+  // [ADDED] Toggle favorite directly from the revealed chat actions.
+  async function toggleFavoriteFromList(chatId, button) {
+    const chat = state.chats.find((item) => String(item.whatsapp_chat_id) === String(chatId));
+    if (!chat || button.disabled) return;
+
+    const next = !chat.is_favorite;
+    button.disabled = true;
+    try {
+      await api(`/chats/${enc(chatId)}/favorite`, {
+        method: "PUT",
+        body: JSON.stringify({ favorite: next })
+      });
+
+      chat.is_favorite = next ? 1 : 0;
+      showToast(next ? "Ditambahkan ke favorit" : "Dihapus dari favorit");
+      await loadChats();
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message);
+    }
+  }
+
+  /* ---------------------------------------------------------
+     Panggilan
+     --------------------------------------------------------- */
+
+  // [ADDED] Call notifications are tracked locally until the Calls tab is opened.
+  const CALLS_LAST_SEEN_KEY = "wagram-calls-last-seen";
+
+  function getCallsLastSeen() {
+    try {
+      const stored = localStorage.getItem(CALLS_LAST_SEEN_KEY);
+      return stored === null ? null : Number(stored) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function markCallsSeen() {
+    try {
+      localStorage.setItem(CALLS_LAST_SEEN_KEY, String(Date.now()));
+    } catch {
+      /* penyimpanan lokal tidak tersedia */
+    }
+    updateBottomNavBadges();
+  }
+
+  function updateBottomNavBadges() {
+    const messageBadge = $("#messagesNavBadge");
+    const callsBadge = $("#callsNavBadge");
+
+    const unreadMessages = state.chats.reduce(
+      (total, chat) => total + Math.max(0, Number(chat.unread_count) || 0),
+      0
+    );
+
+    if (messageBadge) {
+      messageBadge.textContent = unreadMessages > 99 ? "99+" : String(unreadMessages);
+      messageBadge.classList.toggle("hidden", unreadMessages <= 0);
+    }
+
+    if (callsBadge) {
+      const lastSeen = getCallsLastSeen();
+      const unseenCalls = lastSeen === null
+        ? 0
+        : state.calls.filter((call) =>
+            call.direction === "incoming" &&
+            !call.is_archived &&
+            toMs(call.call_timestamp) > lastSeen
+          ).length;
+
+      callsBadge.textContent = unseenCalls > 99 ? "99+" : String(unseenCalls);
+      callsBadge.classList.toggle("hidden", unseenCalls <= 0);
+    }
+  }
+
+  async function loadCalls() {
+    const list = $("#callsList");
+
+    if (!state.callsLoaded) {
+      list.innerHTML = '<div class="loading">Memuat panggilan…</div>';
+    }
+
+    try {
+      const data = await api("/calls?limit=200&archived=true");
+
+      state.calls = data.calls || [];
+      state.callsLoaded = true;
+      state.callsStale = false;
+      // [ADDED] On first install, existing call history is the baseline, not unread.
+      if (getCallsLastSeen() === null) {
+        try {
+          localStorage.setItem(CALLS_LAST_SEEN_KEY, String(Date.now()));
+        } catch {
+          /* penyimpanan lokal tidak tersedia */
+        }
+      }
+      updateBottomNavBadges();
+      renderCalls();
+      if (state.page === "calls") markCallsSeen();
+    } catch (error) {
+      state.callsLoaded = false;
+      list.innerHTML = errorState(error.message, "retryCalls");
+      $("#retryCalls")?.addEventListener("click", loadCalls);
+    }
+  }
+
+  function callKind(call) {
+    if (call.direction === "outgoing") return "outgoing";
+
+    return call.status === "missed" ? "missed" : "incoming";
+  }
+
+  function callLabel(call) {
+    if (call.status === "rejected") return "Ditolak";
+
+    if (call.direction === "outgoing") {
+      return call.status === "no_answer" ? "Tidak dijawab" : "Keluar";
+    }
+
+    return call.status === "missed" ? "Tak terjawab" : "Masuk";
+  }
+
+  function renderCalls() {
+    const list = $("#callsList");
+    const query = state.callSearch.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "").replace(/^0+/, "");
+
+    const favoriteCount = state.calls.filter((call) => Boolean(call.is_favorite) && !call.is_archived).length;
+    const archivedCount = state.calls.filter((call) => Boolean(call.is_archived)).length;
+    const favoriteCountNode = $('#callFavoriteCount');
+    const archivedCountNode = $('#callArchivedCount');
+    if (favoriteCountNode) favoriteCountNode.textContent = favoriteCount;
+    if (archivedCountNode) archivedCountNode.textContent = archivedCount;
+
+    const calls = state.calls.filter((call) => {
+      if (state.callFilter === "archived" && !call.is_archived) return false;
+      if (state.callFilter !== "archived" && call.is_archived) return false;
+      if (state.callFilter === "favorites" && !call.is_favorite) return false;
+      if (["incoming", "outgoing", "missed"].includes(state.callFilter) && callKind(call) !== state.callFilter) {
+        return false;
+      }
+
+      if (!query) return true;
+
+      return (
+        String(call.display_name || "").toLowerCase().includes(query) ||
+        Boolean(digits && String(call.phone_number || "").includes(digits))
+      );
+    });
+
+    $("#callCount").textContent = `${calls.length} panggilan`;
+
+    if (!calls.length) {
+      list.innerHTML = query || state.callFilter !== "all"
+        ? emptyState("search", "Tidak ada hasil", "Coba ubah filter atau kata kunci.")
+        : emptyState(
+            "phone",
+            "Belum ada panggilan",
+            "Panggilan WhatsApp masuk dan keluar akan dicatat di sini."
+          );
+      return;
+    }
+
+    let lastDay = 0;
+
+    list.innerHTML = calls.map((call) => {
+      const ms = toMs(call.call_timestamp);
+      const day = startOfDay(ms);
+      const kind = callKind(call);
+      const canSave = Boolean(call.phone_number);
+
+      let heading = "";
+
+      if (day !== lastDay) {
+        lastDay = day;
+        heading = `<div class="sub-heading">${escapeHTML(dayLabel(ms))}</div>`;
+      }
+
+      const iconName = kind === "missed" ? "call-missed" : kind === "outgoing" ? "call-out" : "call-in";
+
+      return `${heading}
+        <div class="call-swipe-row" data-call-row="${escapeHTML(call.id)}" data-call-phone="${escapeHTML(call.phone_number || "")}">
+          <div class="call-actions">
+            <button class="call-favorite-action" type="button" data-call-favorite="${escapeHTML(call.id)}" aria-label="${call.is_favorite ? "Hapus dari favorit panggilan" : "Favoritkan panggilan"}">${icon("star")}</button>
+            <button class="call-archive-action" type="button" data-call-archive="${escapeHTML(call.id)}" aria-label="Arsipkan panggilan">${icon("archive")}</button>
+          </div>
+          <article class="list-item call-row-content">
+            <div class="call-icon ${kind}">${icon(iconName)}</div>
+            <div class="item-body">
+              <div class="call-name-line">
+                <div class="item-title ${kind === "missed" ? "danger" : ""}">${escapeHTML(call.display_name)}</div>
+                ${canSave ? `<button class="call-inline-save" type="button" data-save-call="${escapeHTML(call.id)}" aria-label="${call.is_saved ? "Edit nama kontak" : "Simpan nomor ke kontak"}" title="${call.is_saved ? "Edit nama kontak" : "Simpan kontak"}">${icon("user-plus")}</button>` : ""}
+              </div>
+              <div class="item-sub call-meta">
+                <span class="call-phone-line">${escapeHTML(formatPhone(call.phone_number) || callLabel(call))}</span>
+                <span class="call-detail">${escapeHTML(callLabel(call))} ${call.is_video ? `· ${icon("video", "mini-icon")} Video` : "· Suara"}${call.is_group ? " · Grup" : ""}</span>
+              </div>
+            </div>
+            <div class="call-side"><span class="item-time">${escapeHTML(timeOnly(ms))}</span></div>
+          </article>
+        </div>`;
+    }).join("");
+  }
+
+  /* ---------------------------------------------------------
+     Kontak
+     --------------------------------------------------------- */
+
+  async function loadContacts() {
+    const list = $("#contactsList");
+
+    if (!state.contactsLoaded) {
+      list.innerHTML = '<div class="loading">Memuat kontak…</div>';
+    }
+
+    try {
+      const data = await api("/contacts");
+
+      state.contacts = data.contacts || [];
+      state.contactsLoaded = true;
+      renderContacts();
+    } catch (error) {
+      state.contactsLoaded = false;
+      list.innerHTML = errorState(error.message, "retryContacts");
+      $("#retryContacts")?.addEventListener("click", loadContacts);
+    }
+  }
+
+  // [ADDED] Customer directory and employee whitelist.
+  async function loadCustomerContacts() {
+    const list = $("#customerContactsList");
+    try {
+      const data = await api("/customer-contacts");
+      state.customerContacts = data.contacts || [];
+      state.customerContactsLoaded = true;
+      renderCustomerContacts();
+    } catch (error) {
+      list.innerHTML = errorState(error.message, "retryCustomerContacts");
+      $("#retryCustomerContacts")?.addEventListener("click", loadCustomerContacts);
+    }
+  }
+  async function loadEmployeeWhitelist() {
+    const list = $("#employeeWhitelistList");
+    try {
+      const data = await api("/employee-whitelist");
+      state.employeeWhitelist = data.employees || [];
+      state.employeeWhitelistLoaded = true;
+      renderEmployeeWhitelist();
+    } catch (error) {
+      list.innerHTML = errorState(error.message, "retryEmployeeWhitelist");
+      $("#retryEmployeeWhitelist")?.addEventListener("click", loadEmployeeWhitelist);
+    }
+  }
+  function updateContactDirectoryView() {
+    const views = { book: "#contactsList", customers: "#customerContactsList", employees: "#employeeWhitelistList" };
+    for (const [key, selector] of Object.entries(views)) {
+      $(selector).classList.toggle("hidden", state.contactTab !== key);
+      const tab = $(`[data-contact-tab="${key}"]`);
+      tab?.classList.toggle("selected", state.contactTab === key);
+      tab?.setAttribute("aria-selected", String(state.contactTab === key));
+    }
+    $("#contactsSearchInput").hidden = state.contactTab !== "book";
+    $("#customerContactsSearchInput").hidden = state.contactTab !== "customers";
+    $("#employeeWhitelistSearchInput").hidden = state.contactTab !== "employees";
+    const label = state.contactTab === "customers" ? "Tambah pelanggan" : state.contactTab === "employees" ? "Tambah karyawan" : "Tambah kontak";
+    $("#addContactButton").setAttribute("aria-label", label);
+    $("#addContactButton").title = label;
+  }
+  function setContactTab(tab) {
+    if (!["book", "customers", "employees"].includes(tab)) return;
+    state.contactTab = tab;
+    updateContactDirectoryView();
+    if (tab === "book") renderContacts();
+    if (tab === "customers") renderCustomerContacts();
+    if (tab === "employees") renderEmployeeWhitelist();
+  }
+  function renderCustomerContacts() {
+    const query = $("#customerContactsSearchInput").value.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "").replace(/^0+/, "");
+    const items = state.customerContacts.filter((c) => !query ||
+      String(c.name || "").toLowerCase().includes(query) ||
+      String(c.phone_number || "").includes(digits) ||
+      String(c.address || "").toLowerCase().includes(query));
+    $("#customerContactsList").innerHTML = items.length ? items.map((c) => `
+      <article class="directory-row"><div class="directory-row-main">
+        ${avatar(c.name, c.name, "small")}<div class="item-body">
+          <div class="item-title">${escapeHTML(c.name)}</div>
+          <div class="item-sub">${escapeHTML(formatPhone(c.phone_number))}</div>
+          ${c.address ? `<div class="directory-address">${escapeHTML(c.address)}</div>` : ""}
+        </div></div><div class="directory-row-actions">
+          <button type="button" data-customer-edit="${c.id}" aria-label="Edit pelanggan">${icon("edit")}</button>
+          <button type="button" data-customer-delete="${c.id}" aria-label="Hapus pelanggan">${icon("trash")}</button>
+      </div></article>`).join("") : emptyState("users", query ? "Pelanggan tidak ditemukan" : "Belum ada pelanggan", query ? "Coba kata kunci lain." : "Simpan data pelanggan yang sudah pernah order.", '<button class="primary-button" data-add-customer type="button">Tambah pelanggan</button>');
+  }
+  function renderEmployeeWhitelist() {
+    const query = $("#employeeWhitelistSearchInput").value.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "").replace(/^0+/, "");
+    const items = state.employeeWhitelist.filter((c) => !query ||
+      String(c.name || "").toLowerCase().includes(query) || String(c.phone_number || "").includes(digits));
+    $("#employeeWhitelistList").innerHTML = items.length ? items.map((c) => `
+      <article class="directory-row"><div class="directory-row-main">
+        ${avatar(c.name || "K", c.name || "Karyawan", "small")}<div class="item-body">
+          <div class="item-title">${escapeHTML(c.name || "Karyawan")}</div>
+          <div class="item-sub">${escapeHTML(formatPhone(c.phone_number))}</div>
+        </div></div><div class="directory-row-actions">
+          <button type="button" data-employee-edit="${c.id}" aria-label="Edit karyawan">${icon("edit")}</button>
+          <button type="button" data-employee-delete="${c.id}" aria-label="Hapus karyawan">${icon("trash")}</button>
+      </div></article>`).join("") : emptyState("users", query ? "Nomor tidak ditemukan" : "Whitelist masih kosong", query ? "Coba kata kunci lain." : "Nomor ini tidak akan menerima balasan AI.", '<button class="primary-button" data-add-employee type="button">Tambah karyawan</button>');
+  }
+  function openCustomerContactSheet(contact = null) {
+    state.editingCustomerId = contact?.id ?? null;
+    $("#customerContactFormTitle").textContent = contact ? "Edit pelanggan" : "Tambah pelanggan";
+    $("#customerContactNameInput").value = contact?.name || "";
+    $("#customerContactPhoneInput").value = contact ? formatPhone(contact.phone_number) : "";
+    $("#customerContactAddressInput").value = contact?.address || "";
+    $("#customerContactSheet").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+    try { tg?.BackButton?.show(); } catch {}
+  }
+  function closeCustomerContactSheet() {
+    $("#customerContactSheet").classList.add("hidden");
+    $("#customerContactForm").reset();
+    document.body.style.overflow = "";
+    state.editingCustomerId = null;
+    if (!document.body.classList.contains("in-chat")) { try { tg?.BackButton?.hide(); } catch {} }
+  }
+  async function submitCustomerContact(event) {
+    event.preventDefault();
+    const name = $("#customerContactNameInput").value.trim();
+    const phone = $("#customerContactPhoneInput").value.trim();
+    const address = $("#customerContactAddressInput").value.trim();
+    const digits = phone.replace(/\D/g, "");
+    if (!name || digits.length < 8 || digits.length > 16) { showToast(!name ? ERROR_TEXT.INVALID_NAME : ERROR_TEXT.INVALID_PHONE); return; }
+    const id = state.editingCustomerId;
+    const button = $("#saveCustomerContactButton");
+    button.disabled = true;
+    try {
+      const data = await api(id == null ? "/customer-contacts" : `/customer-contacts/${enc(id)}`, {
+        method: id == null ? "POST" : "PUT", body: JSON.stringify({ name, phone_number: phone, address })
+      });
+      closeCustomerContactSheet();
+      showToast(id == null ? (data.created === false ? "Pelanggan diperbarui" : "Pelanggan disimpan") : "Pelanggan diperbarui");
+      await loadCustomerContacts();
+    } catch (error) { showToast(error.message); }
+    finally { button.disabled = false; }
+  }
+  async function removeCustomerContact(id) {
+    const c = state.customerContacts.find((x) => String(x.id) === String(id));
+    if (!c || !(await confirmAction(`Hapus data pelanggan ${c.name}?`))) return;
+    try { await api(`/customer-contacts/${enc(id)}`, { method: "DELETE" }); await loadCustomerContacts(); showToast("Pelanggan dihapus"); }
+    catch (error) { showToast(error.message); }
+  }
+  function openEmployeeWhitelistSheet(employee = null) {
+    state.editingEmployeeId = employee?.id ?? null;
+    $("#employeeWhitelistFormTitle").textContent = employee ? "Edit nomor karyawan" : "Tambah nomor karyawan";
+    $("#employeeWhitelistNameInput").value = employee?.name || "";
+    $("#employeeWhitelistPhoneInput").value = employee ? formatPhone(employee.phone_number) : "";
+    $("#employeeWhitelistSheet").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+    try { tg?.BackButton?.show(); } catch {}
+  }
+  function closeEmployeeWhitelistSheet() {
+    $("#employeeWhitelistSheet").classList.add("hidden");
+    $("#employeeWhitelistForm").reset();
+    document.body.style.overflow = "";
+    state.editingEmployeeId = null;
+    if (!document.body.classList.contains("in-chat")) { try { tg?.BackButton?.hide(); } catch {} }
+  }
+  async function submitEmployeeWhitelist(event) {
+    event.preventDefault();
+    const name = $("#employeeWhitelistNameInput").value.trim();
+    const phone = $("#employeeWhitelistPhoneInput").value.trim();
+    const digits = phone.replace(/\D/g, "");
+    if (digits.length < 8 || digits.length > 16) { showToast(ERROR_TEXT.INVALID_PHONE); return; }
+    const id = state.editingEmployeeId;
+    const button = $("#saveEmployeeWhitelistButton");
+    button.disabled = true;
+    try {
+      const data = await api(id == null ? "/employee-whitelist" : `/employee-whitelist/${enc(id)}`, {
+        method: id == null ? "POST" : "PUT", body: JSON.stringify({ name, phone_number: phone })
+      });
+      closeEmployeeWhitelistSheet();
+      showToast(id == null ? (data.created === false ? "Nomor diperbarui" : "Nomor karyawan disimpan") : "Nomor karyawan diperbarui");
+      await loadEmployeeWhitelist();
+    } catch (error) { showToast(error.message); }
+    finally { button.disabled = false; }
+  }
+  async function removeEmployeeWhitelist(id) {
+    const c = state.employeeWhitelist.find((x) => String(x.id) === String(id));
+    if (!c || !(await confirmAction(`Hapus nomor ${formatPhone(c.phone_number)} dari whitelist?`))) return;
+    try { await api(`/employee-whitelist/${enc(id)}`, { method: "DELETE" }); await loadEmployeeWhitelist(); showToast("Nomor dihapus dari whitelist"); }
+    catch (error) { showToast(error.message); }
+  }
+
+  function renderContacts() {
+    const list = $("#contactsList");
+    const query = state.contactSearch.trim().toLowerCase();
+    const digits = query.replace(/\D/g, "").replace(/^0+/, "");
+
+    const contacts = state.contacts.filter((contact) => {
+      if (!query) return true;
+
+      return (
+        contact.name.toLowerCase().includes(query) ||
+        Boolean(digits && contact.phone_number.includes(digits))
+      );
+    });
+
+    if (!contacts.length) {
+      list.innerHTML = query
+        ? emptyState("search", "Kontak tidak ditemukan", "Coba nama atau nomor lain.")
+        : emptyState(
+            "users",
+            "Belum ada kontak",
+            "Simpan nomor HP dari sini, atau kirim /save ke bot Telegram.",
+            `<button class="primary-button" type="button" data-add-contact>${icon("plus")}Tambah kontak</button>`
+          );
+      return;
+    }
+
+    list.innerHTML = contacts.map((contact) => `
+      <div class="contact-swipe-row" data-contact-row="${escapeHTML(contact.id)}">
+        <div class="contact-swipe-actions">
+          <button class="contact-swipe-whatsapp" type="button" data-wa="${escapeHTML(contact.phone_number)}" aria-label="Buka di WhatsApp">${icon("whatsapp")}</button>
+          <button class="contact-swipe-edit" type="button" data-edit="${escapeHTML(contact.id)}" aria-label="Edit kontak">${icon("edit")}</button>
+          <button class="contact-swipe-delete" type="button" data-del="${escapeHTML(contact.id)}" aria-label="Hapus kontak">${icon("trash")}</button>
+        </div>
+        <article class="list-item contact-row-content">
+          ${avatar(contact.name, contact.name, "small")}
+          <div class="item-body">
+            <div class="item-title">${escapeHTML(contact.name)}</div>
+            <div class="item-sub">${escapeHTML(formatPhone(contact.phone_number))}</div>
+          </div>
+        </article>
+      </div>`).join("");
+  }
+
+  function openContactSheet(contact = null, prefill = null) {
+    state.editingId = contact ? contact.id : null;
+
+    $("#contactFormTitle").textContent = contact ? "Edit kontak" : "Tambah kontak";
+    $("#saveContactButton").textContent = contact ? "Simpan perubahan" : "Simpan";
+
+    const nameInput = $("#contactNameInput");
+    const phoneInput = $("#contactPhoneInput");
+
+    nameInput.value = contact?.name || prefill?.name || "";
+    phoneInput.value = contact ? formatPhone(contact.phone_number) : formatPhone(prefill?.phone);
+    nameInput.classList.remove("invalid");
+    phoneInput.classList.remove("invalid");
+
+    $("#contactSheet").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+
+    try {
+      tg?.BackButton?.show();
+    } catch {
+      /* tidak penting */
+    }
+
+    setTimeout(() => (nameInput.value ? phoneInput : nameInput).focus(), 60);
+  }
+
+  function closeContactSheet() {
+    $("#contactSheet").classList.add("hidden");
+    $("#contactForm").reset();
+    document.body.style.overflow = "";
+    state.editingId = null;
+
+    if (!document.body.classList.contains("in-chat")) {
+      try {
+        tg?.BackButton?.hide();
+      } catch {
+        /* tidak penting */
+      }
+    }
+  }
+
+  async function submitContact(event) {
+    event.preventDefault();
+
+    const nameInput = $("#contactNameInput");
+    const phoneInput = $("#contactPhoneInput");
+    const name = nameInput.value.trim();
+    const phone = phoneInput.value.trim();
+    const digits = phone.replace(/\D/g, "");
+
+    nameInput.classList.toggle("invalid", !name);
+    phoneInput.classList.toggle("invalid", digits.length < 8 || digits.length > 16);
+
+    if (!name) {
+      showToast(ERROR_TEXT.INVALID_NAME);
+      nameInput.focus();
+      return;
+    }
+
+    if (digits.length < 8 || digits.length > 16) {
+      showToast(ERROR_TEXT.INVALID_PHONE);
+      phoneInput.focus();
+      return;
+    }
+
+    const editingId = state.editingId;
+    const button = $("#saveContactButton");
+
+    button.disabled = true;
+
+    try {
+      const data = await api(
+        editingId == null ? "/contacts" : `/contacts/${enc(editingId)}`,
+        {
+          method: editingId == null ? "POST" : "PUT",
+          body: JSON.stringify({ name, phone_number: phone })
+        }
+      );
+
+      closeContactSheet();
+      haptic("success");
+
+      showToast(
+        editingId != null
+          ? "Kontak diperbarui"
+          : data.created === false
+            ? "Nomor sudah ada, nama diperbarui"
+            : "Kontak disimpan"
+      );
+
+      state.callsStale = true;
+      await loadContacts();
+
+      // [MODIFIED] Refresh the active chat header and chat list immediately after saving a contact.
+      if (state.currentChat && String(state.currentChat.phone_number || "").replace(/\D/g, "") === digits) {
+        state.currentChat.display_name = name;
+        state.currentChat.name = name;
+        updateConversationHeader();
+      }
+
+      await loadChats(); // [MODIFIED] Wait for the chat list refresh so the saved contact name appears immediately.
+      if (state.page === "calls") await loadCalls();
+    } catch (error) {
+      haptic("error");
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function removeContact(id) {
+    const contact = state.contacts.find((item) => String(item.id) === String(id));
+
+    if (!contact) return;
+
+    if (!(await confirmAction(`Hapus ${contact.name} dari kontak?`))) return;
+
+    try {
+      await api(`/contacts/${enc(id)}`, { method: "DELETE" });
+
+      state.callsStale = true;
+      showToast("Kontak dihapus");
+      await loadContacts();
+      loadChats();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  /* ---------------------------------------------------------
+     [ADDED] WhatsApp session manager actions
+     --------------------------------------------------------- */
+
+  // [ADDED] A newly-created session remains pending until WhatsApp completes pairing.
+  let pendingWhatsAppSessionId = null;
+
+  function openWhatsAppSessions() {
+    renderWhatsAppSessions();
+    $("#whatsappSessionQrWrap").classList.add("hidden");
+    $("#whatsappSessionsModal").classList.remove("hidden");
+    $("#whatsappSessionsModal").classList.remove("is-pairing");
+    document.body.classList.add("whatsapp-sessions-open");
+  }
+
+  function closeWhatsAppSessions() {
+    $("#whatsappSessionsModal").classList.add("hidden");
+    $("#whatsappSessionsModal").classList.remove("is-pairing");
+    document.body.classList.remove("whatsapp-sessions-open");
+    // [ADDED] Remove an abandoned pending session so a cancelled QR does not consume a slot.
+    if (pendingWhatsAppSessionId) {
+      const cancelledSessionId = pendingWhatsAppSessionId;
+      pendingWhatsAppSessionId = null;
+      if (whatsappQrPollTimer) clearInterval(whatsappQrPollTimer);
+      whatsappQrPollTimer = null;
+      // [MODIFIED] Delete only the unpaired account; the previously active account remains selected.
+      api("/sessions/" + enc(cancelledSessionId), {
+        method: "DELETE",
+        headers: { "X-WAGRAM-Session-ID": cancelledSessionId }
+      }).then(async () => {
+        await loadWhatsAppSessions();
+        await loadWhatsAppAccount();
+        renderWhatsAppSessions();
+        renderNotificationPreferences();
+      }).catch(() => {});
+    }
+  }
+
+  async function selectWhatsAppSession(sessionId) {
+    const session = state.whatsappSessions.find((item) => item.session_id === sessionId);
+    if (!session) return;
+    if (isWhatsAppSessionLocked(session)) {
+      openPremiumSheet();
+      return;
+    }
+    state.activeSessionId = sessionId;
+    state.expandedSettingsSessionId = null; // [ADDED] Selecting a row closes the previous session's settings dropdown.
+    localStorage.setItem("wagram-active-whatsapp-session", sessionId);
+    renderWhatsAppSessions();
+    try {
+      await loadWhatsAppAccount();
+      renderNotificationPreferences(); // [ADDED] Load this account's own notification preferences.
+      await Promise.all([loadChats(), loadCalls(), loadContacts()]);
+      state.callsLoaded = true;
+      state.contactsLoaded = true;
+      closeWhatsAppSessions();
+      showToast("Session WhatsApp diganti");
+    } catch (error) { showToast(error.message); }
+  }
+
+  async function createWhatsAppSession() {
+    const button = $("#createWhatsAppSessionButton");
+    const linkedSessionCount = Number(state.whatsappSessionCount ?? state.whatsappSessions.length) || 0;
+    if (linkedSessionCount >= state.whatsappSessionLimit) {
+      showToast("Batas session paket Anda sudah tercapai.");
+      return;
+    }
+    button.disabled = true;
+    try {
+      const created = await api("/sessions", { method: "POST", body: JSON.stringify({}) });
+      const sessionId = created.session && created.session.session_id;
+      if (!sessionId) throw new Error("Server tidak mengembalikan session baru.");
+      // [MODIFIED] Keep the current connected account active while the new account is only pairing.
+      pendingWhatsAppSessionId = sessionId;
+      await api("/sessions/" + enc(sessionId) + "/connect", { method: "POST" });
+      await loadWhatsAppSessions();
+      await showWhatsAppSessionQr(sessionId);
+      renderWhatsAppSessions();
+    } catch (error) {
+      if (pendingWhatsAppSessionId) {
+        const failedSessionId = pendingWhatsAppSessionId;
+        pendingWhatsAppSessionId = null;
+        await api("/sessions/" + enc(failedSessionId), {
+          method: "DELETE",
+          headers: { "X-WAGRAM-Session-ID": failedSessionId }
+        }).catch(() => {});
+      }
+      showToast(error.message);
+      await loadWhatsAppSessions().catch(() => {});
+    } finally { button.disabled = false; }
+  }
+
+  let whatsappQrPollTimer = null;
+  let currentWhatsAppPairingSessionId = null; // [ADDED] Keep the session targeted by both pairing methods.
+
+  // [ADDED] Switch between QR scanning and manual pairing-code instructions.
+  function setWhatsAppPairingMethod(method) {
+    const useCode = method === "code";
+    $("#whatsappPairingQrTab").classList.toggle("is-active", !useCode);
+    $("#whatsappPairingCodeTab").classList.toggle("is-active", useCode);
+    $("#whatsappPairingQrTab").setAttribute("aria-selected", String(!useCode));
+    $("#whatsappPairingCodeTab").setAttribute("aria-selected", String(useCode));
+    $("#whatsappQrMethodPanel").classList.toggle("hidden", useCode);
+    $("#whatsappCodeMethodPanel").classList.toggle("hidden", !useCode);
+  }
+
+  // [ADDED] Copy the generated WhatsApp pairing code with a WebView-safe fallback.
+  async function copyWhatsAppPairingCode() {
+    const code = String($("#whatsappPairingCodeValue").textContent || "").replace(/\\s/g, "");
+    const button = $("#copyWhatsAppPairingCodeButton");
+    if (!code || !button) return;
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(code);
+      } else {
+        const field = document.createElement("textarea");
+        field.value = code;
+        field.setAttribute("readonly", "");
+        field.style.position = "fixed";
+        field.style.opacity = "0";
+        document.body.appendChild(field);
+        field.select();
+        const copied = document.execCommand("copy");
+        field.remove();
+        if (!copied) throw new Error("Clipboard unavailable");
+      }
+      button.querySelector(".copy-label").textContent = "Tersalin";
+      button.classList.add("is-copied");
+      showToast("Kode tautan berhasil disalin.");
+    } catch (error) {
+      showToast("Tidak dapat menyalin kode. Silakan salin manual.");
+    }
+  }
+
+  // [ADDED] Normalize Indonesian phone inputs to international 62 format before sending to WhatsApp.
+  function normalizeWhatsAppPairingPhone(value) {
+    let phone = String(value || "").trim().replace(/\D/g, "");
+
+    if (phone.startsWith("0062")) {
+      phone = "62" + phone.slice(4);
+    } else if (phone.startsWith("0")) {
+      phone = "62" + phone.slice(1);
+    } else if (phone.startsWith("8")) {
+      phone = "62" + phone;
+    }
+
+    return phone;
+  }
+
+  // [ADDED] Request and display a WhatsApp Linked Devices pairing code.
+  async function requestWhatsAppPairingCode() {
+    const sessionId = currentWhatsAppPairingSessionId;
+    const input = $("#whatsappPairingPhoneInput");
+    const button = $("#requestWhatsAppPairingCodeButton");
+    const status = $("#whatsappPairingCodeStatus");
+    const result = $("#whatsappPairingCodeResult");
+    const phoneNumber = normalizeWhatsAppPairingPhone(input.value); // [MODIFIED] Accept local 08, 8, +62, and 62 formats.
+
+    if (!sessionId) {
+      showToast("Session WhatsApp belum tersedia.");
+      return;
+    }
+    if (!/^\d{8,15}$/.test(phoneNumber) || (phoneNumber.startsWith("62") && !/^628\d{7,11}$/.test(phoneNumber))) {
+      status.textContent = "Periksa kembali nomor WhatsApp yang kamu masukkan.";
+      result.classList.add("hidden");
+      input.focus();
+      return;
+    }
+
+    // [ADDED] Show the normalized international number so the user can verify the value sent.
+    input.value = phoneNumber;
+    button.disabled = true;
+    button.textContent = "Meminta kode…";
+    status.textContent = "Menghubungi WhatsApp untuk membuat kode tautan…";
+    result.classList.add("hidden");
+    try {
+      const data = await api("/sessions/" + enc(sessionId) + "/pairing-code", {
+        method: "POST",
+        body: JSON.stringify({ phoneNumber })
+      });
+      const code = String(data.code || "").replace(/\s/g, "");
+      if (!code) throw new Error("WhatsApp tidak mengembalikan kode tautan.");
+      $("#whatsappPairingCodeValue").textContent = code.match(/.{1,4}/g)?.join(" ") || code;
+      result.classList.remove("hidden");
+      status.textContent = ""; // [MODIFIED] The result panel already explains what to do; avoid duplicate instructions.
+    } catch (error) {
+      status.textContent = error.message || "Gagal membuat kode tautan.";
+    } finally {
+      button.disabled = false;
+      button.textContent = "Dapatkan Kode";
+    }
+  }
+
+  async function showWhatsAppSessionQr(sessionId) {
+    openWhatsAppSessions();
+    currentWhatsAppPairingSessionId = sessionId; // [ADDED]
+    setWhatsAppPairingMethod("qr"); // [ADDED] Keep QR as the default method.
+    $("#whatsappPairingPhoneInput").value = "";
+    $("#whatsappPairingCodeResult").classList.add("hidden");
+    $("#whatsappPairingCodeStatus").textContent = "Masukkan nomor WhatsApp untuk mendapatkan kode tautan.";
+    // [MODIFIED] Show a focused pairing popup instead of the account manager list.
+    $("#whatsappSessionsModal").classList.add("is-pairing");
+    $("#whatsappSessionsTitle").textContent = "Hubungkan WhatsApp";
+    $("#closeWhatsAppSessions").setAttribute("aria-label", "Cancel pairing");
+    $("#whatsappSessionQrWrap").classList.remove("hidden");
+    // [ADDED] Reset QR artwork and hide the brand mark until a fresh QR is decoded.
+    const qrImage = $("#whatsappSessionQrImage");
+    const qrFrame = $("#whatsappQrBrandFrame");
+    qrImage.onload = () => {
+      qrFrame?.classList.remove("is-loading");
+      qrFrame?.classList.add("is-ready");
+    };
+    qrImage.onerror = () => {
+      qrFrame?.classList.add("is-loading");
+      qrFrame?.classList.remove("is-ready");
+      $("#whatsappSessionQrStatus").textContent = "Memuat ulang QR…";
+    };
+    qrImage.removeAttribute("src");
+    delete qrImage.dataset.qr;
+    qrFrame?.classList.add("is-loading");
+    qrFrame?.classList.remove("is-ready");
+    const refreshQr = async () => {
+      try {
+        const data = await api("/sessions/" + enc(sessionId) + "/connection");
+        if (data.status === "connected") {
+          // [MODIFIED] Activate the new account only after pairing has actually succeeded.
+          if (pendingWhatsAppSessionId === sessionId) pendingWhatsAppSessionId = null;
+          state.activeSessionId = sessionId;
+          localStorage.setItem("wagram-active-whatsapp-session", sessionId);
+          if (whatsappQrPollTimer) clearInterval(whatsappQrPollTimer);
+          whatsappQrPollTimer = null;
+          $("#whatsappSessionQrWrap").classList.add("hidden");
+          await loadWhatsAppSessions();
+          await loadWhatsAppAccount();
+          renderNotificationPreferences();
+          renderWhatsAppSessions();
+          closeWhatsAppSessions();
+          showToast("WhatsApp berhasil terhubung");
+          return;
+        }
+        if (data.qr) {
+          if (qrImage.dataset.qr !== data.qr) {
+            // [ADDED] Keep the loader visible while the new QR image is being decoded.
+            qrFrame?.classList.add("is-loading");
+            qrFrame?.classList.remove("is-ready");
+            qrImage.dataset.qr = data.qr;
+            qrImage.src = data.qr;
+          }
+          $("#whatsappSessionQrStatus").textContent = "Buka WhatsApp · Perangkat tertaut";
+        } else {
+          // [ADDED] Do not leave a previous QR or its logo visible while a new QR is generated.
+          qrImage.removeAttribute("src");
+          delete qrImage.dataset.qr;
+          qrFrame?.classList.add("is-loading");
+          qrFrame?.classList.remove("is-ready");
+          $("#whatsappSessionQrStatus").textContent = "Menyiapkan koneksi…";
+        }
+      } catch (error) { $("#whatsappSessionQrStatus").textContent = error.message; }
+    };
+    if (whatsappQrPollTimer) clearInterval(whatsappQrPollTimer);
+    await refreshQr();
+    whatsappQrPollTimer = setInterval(refreshQr, 1800);
+  }
+
+  async function connectSelectedWhatsAppSession() {
+    const id = state.activeSessionId;
+    if (!id) return;
+    try {
+      await api("/sessions/" + enc(id) + "/connect", { method: "POST" });
+      await showWhatsAppSessionQr(id);
+      await loadWhatsAppAccount();
+    } catch (error) { showToast(error.message); }
+  }
+
+  // [ADDED] Disconnect only the account whose own Profile row was selected.
+  async function disconnectWhatsAppSession(sessionId) {
+    const session = state.whatsappSessions.find((item) => item.session_id === sessionId);
+    if (!session) return;
+    if (!(await confirmAction("Putuskan koneksi " + (session.label || "WhatsApp") + "?"))) return;
+    try {
+      await api("/sessions/" + enc(sessionId) + "/disconnect", {
+        method: "POST",
+        body: JSON.stringify({}),
+        headers: { "X-WAGRAM-Session-ID": sessionId }
+      });
+      showToast("Akun WhatsApp berhasil diputuskan.");
+      await loadWhatsAppSessions();
+      if (state.activeSessionId === sessionId) await loadWhatsAppAccount();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  async function deleteSelectedWhatsAppSession() {
+    const session = state.whatsappSessions.find((item) => item.session_id === state.activeSessionId);
+    if (!session || session.is_primary) { showToast("Session utama tidak dapat dihapus."); return; }
+    if (!(await confirmAction("Hapus session WhatsApp ini?"))) return;
+    try {
+      await api("/sessions/" + enc(session.session_id), { method: "DELETE" });
+      const primary = state.whatsappSessions.find((item) => item.is_primary);
+      state.activeSessionId = primary ? primary.session_id : null;
+      if (state.activeSessionId) localStorage.setItem("wagram-active-whatsapp-session", state.activeSessionId);
+      await loadWhatsAppAccount();
+      await Promise.all([loadChats(), loadCalls(), loadContacts()]);
+      showToast("Session dihapus");
+    } catch (error) { showToast(error.message); }
+  }
+
+  /* ---------------------------------------------------------
+     Event
+     --------------------------------------------------------- */
+
+  function bindEvents() {
+    // [MODIFIED] Use document-level delegation so the Premium trigger remains reliable
+    // even if another optional control fails to initialize earlier in this function.
+    document.addEventListener("click", (event) => {
+      const premiumMediaButton = event.target.closest("[data-premium-media]");
+      if (premiumMediaButton) {
+        event.preventDefault();
+        openPremiumSheet();
+        return;
+      }
+
+      const addSessionButton = event.target.closest("#addWhatsAppSessionButton");
+      if (addSessionButton) {
+        event.preventDefault();
+        const linkedSessionCount = Number(state.whatsappSessionCount ?? state.whatsappSessions.length) || 0;
+        if (linkedSessionCount >= state.whatsappSessionLimit) {
+          openPremiumSheet();
+        } else {
+          createWhatsAppSession();
+        }
+        return;
+      }
+      const accountSelectButton = event.target.closest("[data-account-select]");
+      if (accountSelectButton) {
+        selectWhatsAppSession(accountSelectButton.dataset.accountSelect);
+        return;
+      }
+      const accountSettingsToggle = event.target.closest("[data-account-settings-toggle]");
+      if (accountSettingsToggle) {
+        // [ADDED] Secondary session settings are Premium-only after subscription expiry.
+        const sessionId = accountSettingsToggle.dataset.accountSettingsToggle;
+        const settingsSession = state.whatsappSessions.find((item) => item.session_id === sessionId);
+        if (isWhatsAppSessionLocked(settingsSession)) {
+          openPremiumSheet();
+          return;
+        }
+        // [MODIFIED] Opening a dropdown never changes the active WhatsApp session.
+        state.expandedSettingsSessionId = state.expandedSettingsSessionId === sessionId ? null : sessionId;
+        mountWhatsAppSessionSettings();
+        renderNotificationPreferences();
+        return;
+      }
+      const primaryAccountSelect = event.target.closest("[data-primary-account-select]");
+      if (primaryAccountSelect) {
+        const primary = state.whatsappSessions.find((item) => item.is_primary);
+        if (primary) selectWhatsAppSession(primary.session_id);
+        return;
+      }
+      const accountDisconnectButton = event.target.closest("[data-account-disconnect]");
+      if (accountDisconnectButton) {
+        disconnectWhatsAppSession(accountDisconnectButton.dataset.accountDisconnect);
+        return;
+      }
+      if (event.target.closest("#closeWhatsAppSessions") || event.target.closest("#whatsappSessionBackdrop") || event.target.closest("#cancelWhatsAppPairingButton")) { closeWhatsAppSessions(); return; }
+      const sessionItem = event.target.closest("[data-session-select]");
+      if (sessionItem) { selectWhatsAppSession(sessionItem.dataset.sessionSelect); return; }
+      if (event.target.closest("#createWhatsAppSessionButton")) {
+        const linkedSessionCount = Number(state.whatsappSessionCount ?? state.whatsappSessions.length) || 0;
+        if (linkedSessionCount >= state.whatsappSessionLimit) {
+          closeWhatsAppSessions();
+          openPremiumSheet();
+        } else {
+          createWhatsAppSession();
+        }
+        return;
+      }
+      if (event.target.closest("#whatsappSessionConnectButton")) { connectSelectedWhatsAppSession(); return; }
+      if (event.target.closest("#whatsappPairingQrTab")) { setWhatsAppPairingMethod("qr"); return; } // [ADDED]
+      if (event.target.closest("#whatsappPairingCodeTab")) { setWhatsAppPairingMethod("code"); return; } // [ADDED]
+      if (event.target.closest("#requestWhatsAppPairingCodeButton")) { requestWhatsAppPairingCode(); return; } // [ADDED]
+      if (event.target.closest("#copyWhatsAppPairingCodeButton")) { copyWhatsAppPairingCode(); return; } // [ADDED]
+      if (event.target.closest("#whatsappSessionDeleteButton")) { deleteSelectedWhatsAppSession(); return; }
+
+      const upgradeButton = event.target.closest("#upgradePremiumButton");
+      if (!upgradeButton) return;
+      event.preventDefault();
+      openPremiumSheet();
+    });
+
+    // [ADDED] Animated global search control in the top bar.
+    $("#searchToggleButton").addEventListener("click", () => {
+      if ($("#topbar").classList.contains("search-open")) {
+        closeTopbarSearch();
+      } else {
+        openTopbarSearch();
+      }
+    });
+    $("#topbarSearchInput").addEventListener("input", handleTopbarSearch);
+    $("#topbarSearchInput").addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeTopbarSearch();
+    });
+
+    // [ADDED] Clear search text from the X inside the expanded input.
+    $("#topbarSearchClear").addEventListener("click", () => {
+      $("#topbarSearchInput").value = "";
+      handleTopbarSearch();
+      $("#topbarSearchInput").focus();
+    });
+
+    // [ADDED] Close expanded search when tapping anywhere outside its control.
+    document.addEventListener("click", (event) => {
+      if (!$("#topbar").classList.contains("search-open")) return;
+      if (event.target.closest("#topbarSearchWrap")) return;
+      closeTopbarSearch(false);
+    });
+
+    $("#backButton").addEventListener("click", () => setPage("chats"));
+    // [ADDED] Return from the WAMO AI page to the chat list.
+    $("#backFromAIBusinessButton")?.addEventListener("click", () => setPage("chats"));
+    // [MODIFIED] Restore chat and migrate legacy local settings to the server when opening WAMO AI.
+    $("#openAIBusinessButton")?.addEventListener("click", async () => {
+      renderAIBusinessHistory();
+      try { await syncAIBusinessSettingsFromServer(); }
+      catch (error) { showToast(error.message || "Pengaturan AI tidak dapat dimuat."); }
+    });
+    $("#wagramAiPinnedRow")?.addEventListener("click", async () => {
+      if (!isAIBusinessEligible()) return;
+      renderAIBusinessHistory();
+      try { await syncAIBusinessSettingsFromServer(); }
+      catch (error) { showToast(error.message || "Pengaturan AI tidak dapat dimuat."); }
+    });
+
+    // [MODIFIED] Open the centered AI Business settings menu.
+    $("#aiBusinessSettingsButton")?.addEventListener("click", openAIBusinessSettings);
+    // [ADDED] Toggle the WAMO AI conversation actions menu.
+    $("#aiBusinessMoreButton")?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = $("#aiBusinessMoreMenu");
+      const button = $("#aiBusinessMoreButton");
+      const isOpen = !menu?.classList.contains("hidden");
+      menu?.classList.toggle("hidden", isOpen);
+      button?.setAttribute("aria-expanded", String(!isOpen));
+    });
+    // [ADDED] Clear only the current WhatsApp session's local AI conversation history.
+    $("#clearAIBusinessHistoryButton")?.addEventListener("click", async () => {
+      $("#aiBusinessMoreMenu")?.classList.add("hidden");
+      $("#aiBusinessMoreButton")?.setAttribute("aria-expanded", "false");
+      const history = getAIBusinessHistory();
+      if (!history.length) {
+        showToast("Riwayat chat masih kosong.");
+        return;
+      }
+      const confirmed = await confirmAction("Bersihkan seluruh riwayat chat WAMO AI untuk akun WhatsApp ini?");
+      if (!confirmed) return;
+      saveAIBusinessHistory([]);
+      renderAIBusinessHistory();
+      showToast("Riwayat chat WAMO AI berhasil dibersihkan.");
+    });
+    // [ADDED] Close the actions menu when tapping outside it.
+    document.addEventListener("click", (event) => {
+      const menu = $("#aiBusinessMoreMenu");
+      const button = $("#aiBusinessMoreButton");
+      if (!menu || menu.classList.contains("hidden")) return;
+      if (menu.contains(event.target) || button?.contains(event.target)) return;
+      menu.classList.add("hidden");
+      button?.setAttribute("aria-expanded", "false");
+    });
+    $("#aiBusinessSettingsModal")?.addEventListener("click", handleAIBusinessSettingsClick);
+    $("#aiBusinessSettingsModal")?.addEventListener("submit", handleAIBusinessSettingsSubmit);
+    // [ADDED] Show the selected QRIS immediately with a lightweight local object URL.
+    // [MODIFIED] Let users crop QRIS before it becomes the preview and saved image.
+    let aiBusinessCropState = null;
+    const closeAIBusinessCrop = () => {
+      const modal = $("#aiBusinessQrisCropModal");
+      if (modal) modal.remove();
+      if (aiBusinessCropState?.imageUrl) URL.revokeObjectURL(aiBusinessCropState.imageUrl);
+      aiBusinessCropState = null;
+    };
+    const drawAIBusinessCrop = () => {
+      const state = aiBusinessCropState;
+      const canvas = $("#aiBusinessQrisCropCanvas");
+      if (!state || !canvas) return;
+      const ctx = canvas.getContext("2d");
+      const size = canvas.width;
+      const side = Math.min(state.image.naturalWidth, state.image.naturalHeight) / state.zoom;
+      const maxX = Math.max(0, (state.image.naturalWidth - side) / 2);
+      const maxY = Math.max(0, (state.image.naturalHeight - side) / 2);
+      state.offsetX = Math.max(-maxX, Math.min(maxX, state.offsetX));
+      state.offsetY = Math.max(-maxY, Math.min(maxY, state.offsetY));
+      const sx = (state.image.naturalWidth - side) / 2 + state.offsetX;
+      const sy = (state.image.naturalHeight - side) / 2 + state.offsetY;
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(state.image, sx, sy, side, side, 0, 0, size, size);
+    };
+    const openAIBusinessCrop = (file, input) => {
+      const imageUrl = URL.createObjectURL(file);
+      const image = new Image();
+      image.onload = () => {
+        const modal = document.createElement("div");
+        modal.id = "aiBusinessQrisCropModal";
+        modal.className = "ai-business-qris-crop-modal";
+        modal.innerHTML = `
+          <div class="ai-business-qris-crop-panel" role="dialog" aria-modal="true" aria-labelledby="aiBusinessQrisCropTitle">
+            <div class="ai-business-qris-crop-heading">
+              <div><span>EDIT GAMBAR</span><h3 id="aiBusinessQrisCropTitle">Potong gambar QRIS</h3></div>
+              <button type="button" data-crop-cancel aria-label="Batal">×</button>
+            </div>
+            <p>Geser gambar untuk mengatur posisi, lalu sesuaikan zoom.</p>
+            <div class="ai-business-qris-crop-stage"><canvas id="aiBusinessQrisCropCanvas" width="640" height="640"></canvas></div>
+            <label class="ai-business-qris-crop-zoom">Zoom <input id="aiBusinessQrisCropZoom" type="range" min="1" max="3" step="0.01" value="1"></label>
+            <div class="ai-business-qris-crop-actions">
+              <button type="button" data-crop-cancel class="ai-business-crop-cancel">Batal</button>
+              <button type="button" data-crop-apply class="ai-business-save-button">Gunakan gambar</button>
+            </div>
+          </div>`;
+        document.body.appendChild(modal);
+        aiBusinessCropState = { image, imageUrl, zoom: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0, input };
+        drawAIBusinessCrop();
+        const canvas = $("#aiBusinessQrisCropCanvas");
+        canvas.addEventListener("pointerdown", (event) => {
+          const state = aiBusinessCropState;
+          state.dragging = true;
+          state.lastX = event.clientX;
+          state.lastY = event.clientY;
+          canvas.setPointerCapture(event.pointerId);
+        });
+        canvas.addEventListener("pointermove", (event) => {
+          const state = aiBusinessCropState;
+          if (!state?.dragging) return;
+          const side = Math.min(state.image.naturalWidth, state.image.naturalHeight) / state.zoom;
+          const scale = side / canvas.clientWidth;
+          state.offsetX -= (event.clientX - state.lastX) * scale;
+          state.offsetY -= (event.clientY - state.lastY) * scale;
+          state.lastX = event.clientX;
+          state.lastY = event.clientY;
+          drawAIBusinessCrop();
+        });
+        const stopDrag = () => { if (aiBusinessCropState) aiBusinessCropState.dragging = false; };
+        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointercancel", stopDrag);
+        $("#aiBusinessQrisCropZoom").addEventListener("input", (event) => {
+          aiBusinessCropState.zoom = Number(event.target.value);
+          drawAIBusinessCrop();
+        });
+        modal.querySelectorAll("[data-crop-cancel]").forEach((button) => button.addEventListener("click", closeAIBusinessCrop));
+        modal.querySelector("[data-crop-apply]").addEventListener("click", async () => {
+          const cropCanvas = document.createElement("canvas");
+          cropCanvas.width = 1200;
+          cropCanvas.height = 1200;
+          const sourceSide = Math.min(image.naturalWidth, image.naturalHeight) / aiBusinessCropState.zoom;
+          const sx = (image.naturalWidth - sourceSide) / 2 + aiBusinessCropState.offsetX;
+          const sy = (image.naturalHeight - sourceSide) / 2 + aiBusinessCropState.offsetY;
+          cropCanvas.getContext("2d").drawImage(image, sx, sy, sourceSide, sourceSide, 0, 0, 1200, 1200);
+          const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, "image/webp", 0.86));
+          if (!blob) {
+            showToast("Gambar gagal dipotong. Coba gambar lain.");
+            return;
+          }
+          const croppedFile = new File([blob], "qris-cropped.webp", { type: "image/webp" });
+          const transfer = new DataTransfer();
+          transfer.items.add(croppedFile);
+          input.files = transfer.files;
+          const preview = $("#aiBusinessQrisPreview");
+          const loading = $("#aiBusinessQrisLoading");
+          const placeholder = $("#aiBusinessQrisPlaceholder");
+          const previewUrl = URL.createObjectURL(croppedFile);
+          loading?.classList.remove("hidden");
+          preview?.classList.remove("hidden");
+          preview?.classList.add("is-loading");
+          placeholder?.classList.add("hidden");
+          if (preview) {
+            preview.onload = async () => {
+              try {
+                if (typeof preview.decode === "function") await preview.decode();
+                preview.classList.remove("is-loading");
+                loading?.classList.add("hidden");
+              } finally { URL.revokeObjectURL(previewUrl); }
+            };
+            preview.onerror = () => {
+              preview.classList.remove("is-loading");
+              loading?.classList.add("hidden");
+              URL.revokeObjectURL(previewUrl);
+            };
+            preview.src = previewUrl;
+          }
+          const label = $("#aiBusinessQrisFileLabel");
+          if (label) label.textContent = "Ganti gambar QRIS";
+          closeAIBusinessCrop();
+        });
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(imageUrl);
+        showToast("Gambar tidak dapat dibuka.");
+      };
+      image.src = imageUrl;
+    };
+    $("#aiBusinessSettingsModal")?.addEventListener("change", (event) => {
+      const input = event.target.closest("#aiBusinessQrisImageInput");
+      if (!input) return;
+      const file = input.files?.[0];
+      if (!file) return;
+      if (!["image/jpeg", "image/png", "image/webp"].includes(file.type) || file.size > 1024 * 1024) {
+        input.value = "";
+        showToast("Pilih JPG, PNG, atau WEBP maksimal 1 MB.");
+        return;
+      }
+      openAIBusinessCrop(file, input);
+    });
+
+    // [ADDED] AI Business settings are stored per active WhatsApp session on this device.
+  const AI_BUSINESS_SETTINGS_KEY = "wagram-ai-business-settings-v1";
+  let aiBusinessSettingsSyncedSession = null;
+
+  function getAIBusinessSettings() {
+    try {
+      const all = JSON.parse(localStorage.getItem(AI_BUSINESS_SETTINGS_KEY) || "{}");
+      return all[String(state.activeSessionId || "default")] || { manager: {}, outlets: [], payment: {}, products: [], aiRules: "" };
+    } catch {
+      return { manager: {}, outlets: [], payment: {}, products: [], aiRules: "" };
+    }
+  }
+
+  async function saveAIBusinessSettings(settings) {
+    try {
+      const all = JSON.parse(localStorage.getItem(AI_BUSINESS_SETTINGS_KEY) || "{}");
+      all[String(state.activeSessionId || "default")] = settings;
+      localStorage.setItem(AI_BUSINESS_SETTINGS_KEY, JSON.stringify(all));
+      await api("/ai-business/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          settings,
+          promptTemplate: settings.aiPromptTemplate || "",
+        })
+      });
+      showToast("Pengaturan usaha tersimpan di server.");
+      return true;
+    } catch (error) {
+      showToast(error.message || "Pengaturan usaha gagal disimpan ke server.");
+      return false;
+    }
+  }
+
+  async function syncAIBusinessSettingsFromServer() {
+    const response = await api("/ai-business/settings");
+    const sessionKey = String(state.activeSessionId || "default");
+    const all = JSON.parse(localStorage.getItem(AI_BUSINESS_SETTINGS_KEY) || "{}");
+    const serverSettings = response.profile?.settings && typeof response.profile.settings === "object"
+      ? response.profile.settings
+      : null;
+    const localSettings = all[sessionKey] && typeof all[sessionKey] === "object"
+      ? all[sessionKey]
+      : null;
+    const hasBusinessData = (settings) => {
+      if (!settings) return false;
+      const manager = settings.manager || {};
+      const hasManager = Boolean(String(manager.name || manager.fullName || manager.phone || "").trim());
+      const hasOutlets = Array.isArray(settings.outlets) && settings.outlets.length > 0;
+      const hasProducts = Array.isArray(settings.products) && settings.products.length > 0;
+      const payment = settings.payment || {};
+      const hasPayment = Object.values(payment).some((value) => String(value ?? "").trim());
+      return hasManager || hasOutlets || hasProducts || hasPayment;
+    };
+
+    // [MODIFIED] Migrate meaningful legacy local data if the server profile is empty.
+    if (localSettings && hasBusinessData(localSettings) && !hasBusinessData(serverSettings)) {
+      await api("/ai-business/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          settings: localSettings,
+          promptTemplate: localSettings.aiPromptTemplate || "",
+        })
+      });
+      aiBusinessSettingsSyncedSession = sessionKey;
+      return localSettings;
+    }
+
+    if (serverSettings) {
+      all[sessionKey] = {
+        ...serverSettings,
+        aiPromptTemplate: response.profile.promptTemplate || "",
+      };
+      localStorage.setItem(AI_BUSINESS_SETTINGS_KEY, JSON.stringify(all));
+      aiBusinessSettingsSyncedSession = sessionKey;
+      return all[sessionKey];
+    }
+
+    const legacySettings = localSettings || { manager: {}, outlets: [], payment: {}, products: [], aiRules: "" };
+    await api("/ai-business/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        settings: legacySettings,
+        promptTemplate: legacySettings.aiPromptTemplate || "",
+      })
+    });
+    aiBusinessSettingsSyncedSession = sessionKey;
+    return legacySettings;
+  }
+
+  async function openAIBusinessSettings() {
+    const modal = $("#aiBusinessSettingsModal");
+    if (!modal) return;
+    $("#aiBusinessSettingsMenu").classList.remove("hidden");
+    $("#aiBusinessSettingsDetail").classList.add("hidden");
+    modal.classList.remove("hidden");
+    try {
+      await syncAIBusinessSettingsFromServer();
+    } catch (error) {
+      showToast(error.message || "Pengaturan AI tidak dapat dimuat dari server.");
+    }
+  }
+
+  function closeAIBusinessSettings() {
+    $("#aiBusinessSettingsModal")?.classList.add("hidden");
+  }
+
+  function renderAIBusinessSettingsSection(section) {
+    const settings = getAIBusinessSettings();
+    const host = $("#aiBusinessSettingsFormHost");
+    const titles = { manager: "Manager", outlets: "Outlet", payment: "Pembayaran QRIS", products: "Produk", ai: "Konfigurasi AI", skillLearning: "Usulan Pembelajaran" };
+    $("#aiBusinessSettingsTitle").textContent = titles[section] || "Kelola bisnis";
+    $("#aiBusinessSettingsMenu").classList.add("hidden");
+    $("#aiBusinessSettingsDetail").classList.remove("hidden");
+
+    if (section === "skillLearning") {
+      host.innerHTML = `
+        <div class="ai-business-data-form">
+          <p>Usulan ini hanya menjadi perubahan yang menunggu keputusan. Skill aktif tidak berubah otomatis setelah disetujui.</p>
+          <form data-ai-skill-proposal-form>
+            <label>Skill
+              <select name="skillId" required>
+                <option value="business-context">Business Context</option>
+                <option value="customer-communication">Customer Communication</option>
+                <option value="consumer-psychology">Consumer Psychology</option>
+                <option value="service-recovery">Service Recovery</option>
+                <option value="human-decision-psychology">Human Decision Psychology</option>
+              </select>
+            </label>
+            <label>Usulan perubahan<textarea name="proposal" maxlength="5000" rows="4" required placeholder="Apa yang perlu dipelajari atau diperbaiki WAGRAM AI?"></textarea></label>
+            <label>Bukti / contoh percakapan<textarea name="evidenceSummary" maxlength="3000" rows="3" required placeholder="Tuliskan contoh dan alasan usulan ini diperlukan."></textarea></label>
+            <button class="ai-business-save-button" type="submit">Kirim usulan</button>
+          </form>
+          <div id="aiSkillProposalList" aria-live="polite"><p>Memuat usulan…</p></div>
+        </div>`;
+      void loadAISkillProposals();
+    } else if (section === "manager") {
+      host.innerHTML = `
+        <form data-ai-settings-form="manager" class="ai-business-data-form">
+          <label>Nama manager<input name="name" type="text" maxlength="100" placeholder="Nama penanggung jawab" value="${escapeHTML(settings.manager.name || "")}"></label>
+          <label>Nomor HP / WhatsApp<input name="phone" type="tel" maxlength="30" placeholder="08xxxxxxxxxx" value="${escapeHTML(settings.manager.phone || "")}"></label>
+          <button class="ai-business-save-button" type="submit">Simpan manager</button>
+        </form>`;
+    } else if (section === "outlets") {
+      const outlets = settings.outlets.length ? settings.outlets : [{ name: "", phone: "", open: "08:00", close: "21:00" }];
+      host.innerHTML = `
+        <form data-ai-settings-form="outlets" class="ai-business-data-form">
+          <div id="aiBusinessOutletFields">${outlets.map((outlet, index) => `
+            <div class="ai-business-outlet-form">
+              <div class="ai-business-outlet-heading"><strong>Outlet ${index + 1}</strong><button type="button" data-remove-outlet="${index}" aria-label="Hapus outlet">Hapus</button></div>
+              <label>Nama outlet<input name="outletName" type="text" maxlength="100" placeholder="Nama outlet" value="${escapeHTML(outlet.name || "")}"></label>
+              <label>Nomor HP outlet<input name="outletPhone" type="tel" maxlength="30" placeholder="Nomor yang bisa dihubungi" value="${escapeHTML(outlet.phone || "")}"></label>
+              <!-- [ADDED] Each outlet has its own Indonesian time zone. -->
+              <label>Zona waktu
+                <select name="outletTimezone">
+                  <option value="Asia/Jakarta" ${(outlet.timezone || outlet.timeZone || "Asia/Jakarta") === "Asia/Jakarta" ? "selected" : ""}>WIB — Waktu Indonesia Barat (UTC+7)</option>
+                  <option value="Asia/Makassar" ${(outlet.timezone || outlet.timeZone || "Asia/Jakarta") === "Asia/Makassar" ? "selected" : ""}>WITA — Waktu Indonesia Tengah (UTC+8)</option>
+                  <option value="Asia/Jayapura" ${(outlet.timezone || outlet.timeZone || "Asia/Jakarta") === "Asia/Jayapura" ? "selected" : ""}>WIT — Waktu Indonesia Timur (UTC+9)</option>
+                </select>
+              </label>
+              <div class="ai-business-time-fields"><label>Jam buka<input name="outletOpen" type="time" value="${escapeHTML(outlet.open || outlet.openTime || "08:00")}"></label><label>Jam tutup<input name="outletClose" type="time" value="${escapeHTML(outlet.close || outlet.closeTime || "21:00")}"></label></div>
+            </div>`).join("")}</div>
+          <button type="button" class="ai-business-add-button" data-add-outlet>+ Tambah outlet</button>
+          <button class="ai-business-save-button" type="submit">Simpan outlet</button>
+        </form>`;
+    } else if (section === "payment") {
+      const qrisImage = String(settings.payment.qrisImage || "");
+      host.innerHTML = `
+        <form data-ai-settings-form="payment" class="ai-business-data-form">
+          <div class="ai-business-qris-upload">
+            <div class="ai-business-qris-preview-wrap">
+              <span class="ai-business-qris-loading-ring ${qrisImage ? "" : "hidden"}" id="aiBusinessQrisLoading" role="status" aria-label="Memuat gambar QRIS"></span>
+              <img id="aiBusinessQrisPreview" class="ai-business-qris-preview ${qrisImage ? "is-loading" : "hidden"}" src="${escapeHTML(qrisImage)}" alt="QRIS pembayaran usaha" decoding="async" fetchpriority="high">
+              <div id="aiBusinessQrisPlaceholder" class="ai-business-qris-placeholder ${qrisImage ? "hidden" : ""}">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v2M17 20h4M20 18v3"/></svg>
+                <strong>Belum ada gambar QRIS</strong>
+                <span>Upload gambar QRIS milik usaha</span>
+              </div>
+            </div>
+            <label class="ai-business-qris-file-label" for="aiBusinessQrisImageInput">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-5 5 5-5 5 5"/><path d="M4 16v4h16v-4"/></svg>
+              <span id="aiBusinessQrisFileLabel">${qrisImage ? "Ganti gambar QRIS" : "Pilih gambar QRIS"}</span>
+            </label>
+            <input id="aiBusinessQrisImageInput" class="ai-business-qris-file-input" name="qrisImage" type="file" accept="image/jpeg,image/png,image/webp">
+            <small>Format JPG, PNG, atau WEBP. Maksimal 1 MB.</small>
+          </div>
+          <button class="ai-business-save-button" type="submit">Simpan QRIS</button>
+        </form>`;
+      // [ADDED] Hide the loading ring as soon as the saved QRIS image is decoded.
+      const qrisPreview = $("#aiBusinessQrisPreview");
+      const qrisLoading = $("#aiBusinessQrisLoading");
+      if (qrisPreview && qrisLoading) {
+        let qrisPreviewFinished = false;
+        const finishQrisPreview = (loaded) => {
+          if (qrisPreviewFinished) return;
+          qrisPreviewFinished = true;
+          qrisLoading.classList.add("hidden");
+          qrisPreview.classList.remove("is-loading");
+          if (!loaded) {
+            qrisPreview.classList.add("hidden");
+            $("#aiBusinessQrisPlaceholder")?.classList.remove("hidden");
+          }
+        };
+        // [MODIFIED] Keep the ring visible until the browser has fully decoded the image, not merely received its bytes.
+        const decodeQrisPreview = async () => {
+          if (!qrisPreview.naturalWidth) {
+            finishQrisPreview(false);
+            return;
+          }
+          try {
+            if (typeof qrisPreview.decode === "function") {
+              await qrisPreview.decode();
+            }
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            finishQrisPreview(true);
+          } catch {
+            finishQrisPreview(false);
+          }
+        };
+        qrisPreview.addEventListener("load", decodeQrisPreview, { once: true });
+        qrisPreview.addEventListener("error", () => finishQrisPreview(false), { once: true });
+        if (qrisPreview.complete) decodeQrisPreview();
+      }
+    } else if (section === "products") {
+      const products = settings.products.length ? settings.products : [{ name: "", price: "", stock: "" }];
+      host.innerHTML = `
+        <form data-ai-settings-form="products" class="ai-business-data-form">
+          <div id="aiBusinessProductFields">${products.map((product, index) => `
+            <div class="ai-business-product-form">
+              <div class="ai-business-outlet-heading"><strong>Produk ${index + 1}</strong><button type="button" data-remove-product="${index}" aria-label="Hapus produk">Hapus</button></div>
+              <label>Nama produk<input name="productName" type="text" maxlength="120" placeholder="Nama produk" value="${escapeHTML(product.name || "")}"></label>
+              <div class="ai-business-time-fields"><label>Harga (Rp)<input name="productPrice" type="number" min="0" step="1" placeholder="0" value="${escapeHTML(product.price || "")}"></label><label>Stok<input name="productStock" type="number" min="0" step="1" placeholder="0" value="${escapeHTML(product.stock || "")}"></label></div>
+            </div>`).join("")}</div>
+          <button type="button" class="ai-business-add-button" data-add-product>+ Tambah produk</button>
+          <button class="ai-business-save-button" type="submit">Simpan produk</button>
+        </form>`;
+    } else if (section === "ai") {
+      host.innerHTML = `
+        <form data-ai-settings-form="ai" class="ai-business-data-form ai-business-rules">
+          <div class="ai-business-rule-field">
+            <label for="aiBusinessPromptTemplateInput">Instruksi AI</label>
+            <p>Atur cara WAMO AI memahami dan menjawab pelanggan.</p>
+            <textarea id="aiBusinessPromptTemplateInput" name="promptTemplate" rows="5" maxlength="6000" placeholder="Tulis instruksi dasar untuk WAMO AI...">${escapeHTML(settings.aiPromptTemplate || "")}</textarea>
+          </div>
+          <div class="ai-business-rule-field">
+            <label for="aiBusinessRulesInput">Aturan &amp; Batasan</label>
+            <p>Tentukan hal yang tidak boleh ditangani AI dan kapan harus menghubungi manager.</p>
+            <textarea id="aiBusinessRulesInput" name="aiRules" rows="4" maxlength="3000" placeholder="Contoh: Untuk komplain serius, arahkan pelanggan ke manager.">${escapeHTML(settings.aiRules || "")}</textarea>
+          </div>
+          <button class="ai-business-save-button" type="submit">Simpan konfigurasi AI</button>
+        </form>`;
+    }
+  }
+
+  function handleAIBusinessSettingsClick(event) {
+    if (event.target.closest("[data-close-ai-settings]")) {
+      closeAIBusinessSettings();
+      return;
+    }
+    const proposalReviewButton = event.target.closest("[data-ai-skill-proposal-review]");
+    if (proposalReviewButton) {
+      void reviewAISkillProposal(Number(proposalReviewButton.dataset.aiSkillProposalReview), proposalReviewButton.dataset.approved === "true");
+      return;
+    }
+    const sectionButton = event.target.closest("[data-ai-settings-section]");
+    if (sectionButton) {
+      // [ADDED] On touch screens, the first tap expands the tile; the second opens its settings.
+      const touchNavigation = window.matchMedia("(hover: none), (pointer: coarse)").matches;
+      const alreadyExpanded = sectionButton.classList.contains("is-expanded");
+      if (touchNavigation && !alreadyExpanded) {
+        const grid = sectionButton.closest(".ai-business-settings-grid");
+        grid?.querySelectorAll(".ai-business-setting-tile").forEach((tile) => {
+          tile.classList.toggle("is-expanded", tile === sectionButton);
+          tile.setAttribute("aria-expanded", tile === sectionButton ? "true" : "false");
+        });
+        return;
+      }
+      sectionButton.closest(".ai-business-settings-grid")?.querySelectorAll(".ai-business-setting-tile").forEach((tile) => {
+        tile.classList.remove("is-expanded");
+        tile.setAttribute("aria-expanded", "false");
+      });
+      renderAIBusinessSettingsSection(sectionButton.dataset.aiSettingsSection);
+      return;
+    }
+    if (event.target.closest("[data-back-ai-settings]")) {
+      $("#aiBusinessSettingsDetail").classList.add("hidden");
+      $("#aiBusinessSettingsMenu").classList.remove("hidden");
+      $("#aiBusinessSettingsTitle").textContent = "Kelola bisnis";
+      $("#aiBusinessSettingsMenu").querySelectorAll(".ai-business-setting-tile").forEach((tile) => {
+        tile.classList.remove("is-expanded");
+        tile.setAttribute("aria-expanded", "false");
+      });
+      return;
+    }
+    if (event.target.closest("[data-add-outlet]")) {
+      const wrap = $("#aiBusinessOutletFields");
+      const index = wrap.querySelectorAll(".ai-business-outlet-form").length;
+      wrap.insertAdjacentHTML("beforeend", `
+        <div class="ai-business-outlet-form">
+          <div class="ai-business-outlet-heading"><strong>Outlet ${index + 1}</strong><button type="button" data-remove-outlet="${index}">Hapus</button></div>
+          <label>Nama outlet<input name="outletName" type="text" maxlength="100" placeholder="Nama outlet"></label>
+          <label>Nomor HP outlet<input name="outletPhone" type="tel" maxlength="30" placeholder="Nomor yang bisa dihubungi"></label>
+          <!-- [ADDED] Default new outlets to WIB until the owner selects their actual zone. -->
+          <label>Zona waktu
+            <select name="outletTimezone">
+              <option value="Asia/Jakarta" selected>WIB — Waktu Indonesia Barat (UTC+7)</option>
+              <option value="Asia/Makassar">WITA — Waktu Indonesia Tengah (UTC+8)</option>
+              <option value="Asia/Jayapura">WIT — Waktu Indonesia Timur (UTC+9)</option>
+            </select>
+          </label>
+          <div class="ai-business-time-fields"><label>Jam buka<input name="outletOpen" type="time" value="08:00"></label><label>Jam tutup<input name="outletClose" type="time" value="21:00"></label></div>
+        </div>`);
+      return;
+    }
+    if (event.target.closest("[data-add-product]")) {
+      const wrap = $("#aiBusinessProductFields");
+      const index = wrap.querySelectorAll(".ai-business-product-form").length;
+      wrap.insertAdjacentHTML("beforeend", `
+        <div class="ai-business-product-form">
+          <div class="ai-business-outlet-heading"><strong>Produk ${index + 1}</strong><button type="button" data-remove-product="${index}">Hapus</button></div>
+          <label>Nama produk<input name="productName" type="text" maxlength="120" placeholder="Nama produk"></label>
+          <div class="ai-business-time-fields"><label>Harga (Rp)<input name="productPrice" type="number" min="0" step="1" placeholder="0"></label><label>Stok<input name="productStock" type="number" min="0" step="1" placeholder="0"></label></div>
+        </div>`);
+      return;
+    }
+    const removeOutlet = event.target.closest("[data-remove-outlet]");
+    if (removeOutlet) {
+      const items = [...$("#aiBusinessOutletFields").querySelectorAll(".ai-business-outlet-form")];
+      if (items.length > 1) items[Number(removeOutlet.dataset.removeOutlet)]?.remove();
+      return;
+    }
+    const removeProduct = event.target.closest("[data-remove-product]");
+    if (removeProduct) {
+      const items = [...$("#aiBusinessProductFields").querySelectorAll(".ai-business-product-form")];
+      if (items.length > 1) items[Number(removeProduct.dataset.removeProduct)]?.remove();
+    }
+  }
+
+  async function handleAIBusinessSettingsSubmit(event) {
+    const proposalForm = event.target.closest("[data-ai-skill-proposal-form]");
+    if (proposalForm) {
+      event.preventDefault();
+      const values = new FormData(proposalForm);
+      const submitButton = proposalForm.querySelector('button[type="submit"]');
+      if (submitButton) submitButton.disabled = true;
+      void api("/ai/skill-proposals", {
+        method: "POST",
+        body: JSON.stringify({
+          skillId: String(values.get("skillId") || ""),
+          proposal: String(values.get("proposal") || "").trim(),
+          evidenceSummary: String(values.get("evidenceSummary") || "").trim()
+        })
+      }).then(() => {
+        showToast("Usulan pembelajaran tersimpan.");
+        proposalForm.reset();
+        return loadAISkillProposals();
+      }).catch((error) => showToast(error.message || "Usulan gagal disimpan."))
+        .finally(() => { if (submitButton) submitButton.disabled = false; });
+      return;
+    }
+    const form = event.target.closest("[data-ai-settings-form]");
+    if (!form) return;
+    event.preventDefault();
+    const data = new FormData(form);
+    const settings = getAIBusinessSettings();
+    const section = form.dataset.aiSettingsForm;
+
+    if (section === "ai") {
+      settings.aiPromptTemplate = String(data.get("promptTemplate") || "").trim();
+      settings.aiRules = String(data.get("aiRules") || "").trim();
+    } else if (section === "manager") {
+      settings.manager = { name: String(data.get("name") || "").trim(), phone: String(data.get("phone") || "").trim() };
+    } else if (section === "outlets") {
+      const names = data.getAll("outletName");
+      const phones = data.getAll("outletPhone");
+      const opens = data.getAll("outletOpen");
+      const closes = data.getAll("outletClose");
+      // [ADDED] Persist the selected IANA time zone independently for every outlet.
+      const timezones = data.getAll("outletTimezone");
+      settings.outlets = names.map((name, index) => ({ name: String(name).trim(), phone: String(phones[index] || "").trim(), open: String(opens[index] || ""), close: String(closes[index] || ""), timezone: String(timezones[index] || "Asia/Jakarta") })).filter((outlet) => outlet.name);
+    } else if (section === "payment") {
+      const imageFile = data.get("qrisImage");
+      if (imageFile instanceof File && imageFile.size > 0) {
+        if (!["image/jpeg", "image/png", "image/webp"].includes(imageFile.type)) {
+          showToast("Format gambar harus JPG, PNG, atau WEBP.");
+          return;
+        }
+        if (imageFile.size > 1024 * 1024) {
+          showToast("Ukuran gambar QRIS maksimal 1 MB.");
+          return;
+        }
+        try {
+          // [MODIFIED] Resize and encode QRIS before storing it to reduce preview and sync cost.
+          const optimizedImage = await createImageBitmap(imageFile);
+          const maxDimension = 1200;
+          const scale = Math.min(1, maxDimension / Math.max(optimizedImage.width, optimizedImage.height));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(optimizedImage.width * scale));
+          canvas.height = Math.max(1, Math.round(optimizedImage.height * scale));
+          canvas.getContext("2d").drawImage(optimizedImage, 0, 0, canvas.width, canvas.height);
+          optimizedImage.close();
+          const optimizedBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.82));
+          const imageToRead = optimizedBlob || imageFile;
+          settings.payment = { ...settings.payment, qrisImage: await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("Gambar QRIS gagal dibaca."));
+            reader.readAsDataURL(imageToRead);
+          }) };
+        } catch (error) {
+          showToast(error.message || "Gambar QRIS gagal dibaca.");
+          return;
+        }
+      } else {
+        settings.payment = { ...settings.payment };
+      }
+    } else if (section === "products") {
+      const names = data.getAll("productName");
+      const prices = data.getAll("productPrice");
+      const stocks = data.getAll("productStock");
+      settings.products = names.map((name, index) => ({ name: String(name).trim(), price: String(prices[index] || "").trim(), stock: String(stocks[index] || "").trim() })).filter((product) => product.name);
+    }
+    saveAIBusinessSettings(settings);
+    closeAIBusinessSettings();
+  }
+
+  // [ADDED] Load owner-scoped skill learning proposals for the active WhatsApp session.
+  async function loadAISkillProposals() {
+    const host = $("#aiSkillProposalList");
+    if (!host) return;
+    host.innerHTML = "<p>Memuat usulan…</p>";
+    try {
+      const data = await api("/ai/skill-proposals");
+      const proposals = Array.isArray(data.proposals) ? data.proposals : [];
+      if (!proposals.length) {
+        host.innerHTML = "<p>Belum ada usulan pembelajaran untuk sesi ini.</p>";
+        return;
+      }
+      const labels = { pending: "Menunggu keputusan", approved: "Disetujui", rejected: "Ditolak", applied: "Diterapkan" };
+      host.innerHTML = proposals.map((item) => `
+        <article class="ai-business-data-form" style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:12px">
+          <strong>${escapeHTML(item.skill_id)}</strong>
+          <p>${escapeHTML(item.proposal)}</p>
+          <small>Bukti: ${escapeHTML(item.evidence_summary)}</small>
+          <p><strong>Status:</strong> ${escapeHTML(labels[item.status] || item.status)}</p>
+          ${item.status === "pending" ? `
+            <div class="ai-business-time-fields">
+              <button type="button" class="ai-business-save-button" data-ai-skill-proposal-review="${Number(item.id)}" data-approved="true">Setujui</button>
+              <button type="button" class="secondary-button" data-ai-skill-proposal-review="${Number(item.id)}" data-approved="false">Tolak</button>
+            </div>` : ""}
+        </article>`).join("");
+    } catch (error) {
+      host.innerHTML = `<p>${escapeHTML(error.message || "Usulan tidak dapat dimuat.")}</p><button type="button" class="secondary-button" id="retryAISkillProposals">Coba lagi</button>`;
+      $("#retryAISkillProposals")?.addEventListener("click", loadAISkillProposals, { once: true });
+    }
+  }
+
+  // [ADDED] Approve or reject a proposal; approval records owner consent but never edits skill files.
+  async function reviewAISkillProposal(proposalId, approved) {
+    if (!Number.isSafeInteger(proposalId) || proposalId <= 0) return;
+    try {
+      await api("/ai/skill-proposals/" + proposalId + "/review", {
+        method: "POST",
+        body: JSON.stringify({ approved })
+      });
+      showToast(approved ? "Usulan disetujui." : "Usulan ditolak.");
+      await loadAISkillProposals();
+    } catch (error) {
+      showToast(error.message || "Keputusan usulan gagal disimpan.");
+    }
+  }
+
+  // [ADDED] Keep WAMO AI conversation history locally per WhatsApp session.
+  const AI_BUSINESS_HISTORY_KEY = "wagram-ai-business-history-v1";
+
+  function getAIBusinessHistory() {
+    try {
+      const all = JSON.parse(localStorage.getItem(AI_BUSINESS_HISTORY_KEY) || "{}");
+      const sessionKey = String(state.activeSessionId || "default");
+      const history = all[sessionKey];
+      if (!Array.isArray(history)) return [];
+      // [MODIFIED] Remove legacy training/simulated-customer messages from existing local chat history.
+      const standardHistory = history.filter((item) => (
+        !String(item?.role || "").startsWith("training_") &&
+        item?.training !== true &&
+        item?.simulatedCustomer !== true
+      ));
+      if (standardHistory.length !== history.length) {
+        all[sessionKey] = standardHistory.slice(-30);
+        localStorage.setItem(AI_BUSINESS_HISTORY_KEY, JSON.stringify(all));
+      }
+      return standardHistory.slice(-30);
+    } catch {
+      return [];
+    }
+  }
+
+  function saveAIBusinessHistory(history) {
+    try {
+      const all = JSON.parse(localStorage.getItem(AI_BUSINESS_HISTORY_KEY) || "{}");
+      all[String(state.activeSessionId || "default")] = history.slice(-30);
+      localStorage.setItem(AI_BUSINESS_HISTORY_KEY, JSON.stringify(all));
+    } catch {
+      showToast("Riwayat percakapan tidak dapat disimpan di perangkat ini.");
+    }
+  }
+
+  function renderAIBusinessHistory() {
+    const messages = $("#aiBusinessMessages");
+    if (!messages) return;
+    const history = getAIBusinessHistory();
+    const intro = $("#aiBusinessIntro");
+    if (intro) intro.classList.toggle("hidden", history.length > 0);
+    messages.innerHTML = history.map((item) => {
+      const trace = item.role === "assistant" && item.trace && typeof item.trace === "object"
+        ? `
+          <details class="ai-business-trace">
+            <summary>Lihat proses pemeriksaan AI</summary>
+            <div class="ai-business-trace-content">
+              <strong>1. Mengenali pertanyaan</strong>
+              <p>${escapeHTML(item.trace.recognition || "Tidak tersedia")}</p>
+              <strong>2. Mengenali waktu</strong>
+              <p>${escapeHTML(item.trace.time?.status === "available"
+                ? (item.trace.time.localTime + " " + item.trace.time.zoneLabel + " • " + item.trace.time.localDate + " • " + item.trace.time.outlet)
+                : "Belum dapat ditentukan: " + (item.trace.time?.status || "data waktu outlet tidak tersedia"))}</p>
+              <strong>3. Skill psychology</strong>
+              <p>${escapeHTML(item.trace.psychologySkill?.status === "used"
+                ? item.trace.psychologySkill.name + " — " + item.trace.psychologySkill.contribution
+                : "Tidak diperlukan")}</p>
+              <strong>4. Skill marketing</strong>
+              <p>${escapeHTML(item.trace.marketingSkill?.status === "used"
+                ? item.trace.marketingSkill.name + " — " + item.trace.marketingSkill.contribution
+                : "Tidak diperlukan pada konteks ini")}</p>
+              <strong>5. Check produk untuk marketing</strong>
+              <p>${escapeHTML(item.trace.productCheck?.status === "checked"
+                ? item.trace.productCheck.reason + (item.trace.productCheck.selectedProduct
+                  ? " Produk terpilih: " + item.trace.productCheck.selectedProduct.name + (item.trace.productCheck.selectedProduct.price != null ? " • Rp" + Number(item.trace.productCheck.selectedProduct.price).toLocaleString("id-ID") : "")
+                  : " Produk pelengkap belum dipilih.")
+                : item.trace.productCheck?.reason || "Tidak dilakukan")}</p>
+              <strong>6. Tindakan</strong>
+              <p>${escapeHTML(item.trace.action || "Tidak tersedia")}</p>
+              <strong>7. Perlu menyimpan ke database?</strong>
+              <p>${escapeHTML(item.trace.database?.label || "Tidak") + " — " + escapeHTML(item.trace.database?.reason || "Tidak ada data bisnis permanen yang perlu disimpan.")}</p>
+              <p>${escapeHTML(item.trace.database?.auditLogSaved === true
+                ? "Log audit ringkas: Ya — metadata proses disimpan tanpa isi percakapan atau private reasoning."
+                : item.trace.database?.auditLogSaved === false
+                  ? "Log audit ringkas: Gagal disimpan."
+                  : "Log audit ringkas: status belum tersedia.")}</p>
+              <strong>8. Data yang digunakan</strong>
+              <ul>${(Array.isArray(item.trace.dataUsed) ? item.trace.dataUsed : []).map((value) => `<li>${escapeHTML(value)}</li>`).join("")}</ul>
+              <strong>Status pemeriksaan</strong>
+              <p>${escapeHTML(item.trace.status || "Tidak tersedia")}</p>
+              <strong>9. Jawaban</strong>
+              <p>${escapeHTML(item.trace.expectedAnswer || item.content)}</p>
+            </div>
+          </details>`
+        : "";
+      // [MODIFIED] Render the QRIS image and its friendly caption as two separate chat bubbles.
+      if (item.role === "assistant" && item.qrisImage) {
+        return `
+          <div class="message ai-business-reply ai-business-qris-image-bubble">
+            <img class="ai-business-qris-message-image" src="${escapeHTML(getAIBusinessSettings().payment?.qrisImage || "")}" alt="QRIS pembayaran usaha" loading="lazy">
+          </div>
+          <div class="message ai-business-reply">
+            <div class="message-text">${escapeHTML(item.content)}</div>
+            ${trace}
+            <div class="message-time">${escapeHTML(item.time || "")}</div>
+          </div>`;
+      }
+      return `
+        <div class="message ${item.role === "user" ? "outgoing" : "ai-business-reply"}">
+          <div class="message-text">${escapeHTML(item.content)}</div>
+          ${trace}
+          <div class="message-time">${escapeHTML(item.time || "")}</div>
+        </div>`;
+    }).join("");
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  async function sendAIBusinessMessage(value) {
+    const input = $("#aiBusinessInput");
+    const form = $("#aiBusinessComposer");
+    const button = $("#sendAIBusinessMessageButton");
+    const messages = $("#aiBusinessMessages");
+    const intro = $("#aiBusinessIntro");
+    const text = String(value || "").trim();
+    if (!text || form?.dataset.sending === "true") return;
+
+    if (aiBusinessSettingsSyncedSession !== String(state.activeSessionId || "default")) {
+      try {
+        await syncAIBusinessSettingsFromServer();
+      } catch (error) {
+        showToast(error.message || "Data bisnis belum berhasil dimuat dari server.");
+        return;
+      }
+    }
+
+    if (intro) intro.classList.add("hidden");
+    const history = getAIBusinessHistory();
+    const timestamp = timeOnly(Date.now());
+    // [MODIFIED] WAMO AI now uses one standard conversation flow; training mode is removed.
+    history.push({ role: "user", content: text, time: timestamp });
+    saveAIBusinessHistory(history);
+    renderAIBusinessHistory();
+
+    form.dataset.sending = "true";
+    if (button) button.disabled = true;
+    if (input) input.value = "";
+    const typingId = `ai-business-typing-${Date.now()}`;
+    messages.insertAdjacentHTML("beforeend", `
+      <div class="ai-business-thinking-row" id="${typingId}">
+        <img class="ai-business-thinking-mascot" src="./assets/wamo-thinking-mascot.webp" alt="" aria-hidden="true">
+        <div class="message ai-business-reply ai-business-thinking">
+          <div class="ai-business-thinking-label">
+            <span>WAMO AI sedang berpikir</span>
+            <span class="ai-business-thinking-dots" aria-label="Memproses"><i></i><i></i><i></i></span>
+          </div>
+        </div>
+      </div>`);
+    messages.scrollTop = messages.scrollHeight;
+
+    try {
+      const result = await api("/ai-business/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          message: text,
+          history: history.slice(0, -1).map((item) => ({ role: item.role === "user" ? "user" : "assistant", content: item.content }))
+        })
+      });
+      const reply = String(result.reply || "").trim();
+      if (!reply) throw new Error("WAMO AI mengirim jawaban kosong.");
+      const updated = getAIBusinessHistory();
+      updated.push({ role: "assistant", content: reply, qrisImage: Boolean(result.qrisImage), time: timeOnly(Date.now()), trace: result.trace || null });
+      saveAIBusinessHistory(updated);
+      renderAIBusinessHistory();
+    } catch (error) {
+      document.getElementById(typingId)?.remove();
+      messages.insertAdjacentHTML("beforeend", `
+        <div class="message ai-business-reply ai-business-error">
+          <div class="message-text">${escapeHTML(error.message || "WAMO AI belum dapat menjawab.")}</div>
+          <div class="message-time">${escapeHTML(timeOnly(Date.now()))}</div>
+        </div>`);
+      messages.scrollTop = messages.scrollHeight;
+    } finally {
+      form.dataset.sending = "false";
+      if (button) button.disabled = false;
+      // [REMOVED] Do not refocus the composer after AI replies; this reopens the mobile keyboard.
+    }
+  }
+
+  // [MODIFIED] Send the owner's message to the authenticated WAMO AI Business API.
+  $("#aiBusinessComposer")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendAIBusinessMessage($("#aiBusinessInput")?.value || "");
+  });
+
+  // [ADDED] Quick prompts use the same OpenRouter request path as typed messages.
+  $("#aiBusinessIntro")?.addEventListener("click", (event) => {
+    const suggestion = event.target.closest("[data-ai-prompt]");
+    if (!suggestion) return;
+    const input = $("#aiBusinessInput");
+    if (input) input.value = suggestion.dataset.aiPrompt || "";
+    sendAIBusinessMessage(input?.value || "");
+  });
+
+    // Tema
+    $("#themeButton").addEventListener("click", () => {
+      setThemePref(resolveScheme() === "dark" ? "light" : "dark");
+    });
+
+    // [ADDED] Profile theme control mirrors the global light/dark toggle.
+    $("#profileThemeButton").addEventListener("click", () => {
+      setThemePref(resolveScheme() === "dark" ? "light" : "dark");
+    });
+
+    // [ADDED] Open the Premium plan selector from the Profile page.
+    const premiumSheet = $("#premiumPage");
+    let selectedPremiumPeriod = "3d";
+    const premiumPlans = {
+      "3d": {
+        label: "PREMIUM 3 HARI",
+        oldPrice: "Rp24.000",
+        price: "Rp14.000",
+        note: "Harga spesial untuk langganan pertama",
+        sessions: 2,
+        sessionDescription: "Hubungkan hingga 2 akun WhatsApp secara bersamaan."
+      },
+      "7d": {
+        label: "PREMIUM 7 HARI",
+        oldPrice: "Rp56.000",
+        price: "Rp44.000",
+        note: "Akses Premium selama 7 hari",
+        sessions: 3,
+        sessionDescription: "Hubungkan hingga 3 akun WhatsApp secara bersamaan."
+      },
+      "30d": {
+        label: "PREMIUM 30 HARI",
+        oldPrice: "Rp240.000",
+        price: "Rp149.000",
+        note: "Akses Premium selama 30 hari",
+        sessions: 5,
+        sessionDescription: "Hubungkan hingga 5 akun WhatsApp secara bersamaan."
+      }
+    };
+
+    // [ADDED] Only offer durations longer than the user's current Premium package.
+    function getAvailablePremiumPeriods() {
+      const membership = state.membership;
+      const isPremium = Boolean(
+        membership?.plan &&
+        membership.plan !== "free" &&
+        (!membership.plan_expires_at || Number(membership.plan_expires_at) > Date.now())
+      );
+
+      if (!isPremium) return ["3d", "7d", "30d"];
+      if (membership.plan === "premium-a") return ["7d", "30d"];
+      if (membership.plan === "premium-b") return ["30d"];
+      if (membership.plan === "premium-c") return ["30d"];
+
+      return ["3d", "7d", "30d"];
+    }
+
+    function renderPremiumPlan(period) {
+      selectedPremiumPeriod = period;
+      const plan = premiumPlans[period];
+      $("#premiumPlanLabel").textContent = plan.label;
+      $("#premiumOldPrice").textContent = plan.oldPrice;
+      $("#premiumOldPrice").hidden = !plan.oldPrice;
+      $("#premiumCurrentPrice").textContent = plan.price;
+      const isPremium = getAvailablePremiumPeriods().length !== 3;
+      $("#premiumPriceNote").textContent = isPremium
+        ? "Masa aktif baru ditambahkan setelah pembayaran diverifikasi."
+        : plan.note;
+      $("#premiumSessionCount").textContent = `${plan.sessions} WhatsApp session`;
+      $("#premiumSessionDescription").textContent = plan.sessionDescription;
+      $("#premiumTableSessions").textContent = String(plan.sessions);
+      // [ADDED] Keep the Premium feature table in sync with the selected duration.
+      const memberFeatureSessions = $("#premiumMemberFeatureSessions");
+      const memberFeatureHeading = $("#premiumMemberFeatureHeading");
+      const wamoFeature = $("#premiumWamoBusinessFeature");
+      if (memberFeatureSessions) memberFeatureSessions.textContent = `${plan.sessions} akun`;
+      if (memberFeatureHeading) memberFeatureHeading.textContent = period === "30d" ? "Premium 30 Hari" : `Premium ${period === "7d" ? "7" : "3"} Hari`;
+      wamoFeature?.classList.toggle("hidden", period !== "30d");
+      $("#premiumButtonOldPrice").textContent = plan.oldPrice;
+      $("#premiumButtonOldPrice").hidden = !plan.oldPrice;
+      $("#premiumButtonCurrentPrice").textContent = `${isPremium && period === "30d" && state.membership?.plan === "premium-c" ? "Perpanjang 30 Hari" : isPremium ? "Upgrade · " + plan.price : "Lanjutkan · " + plan.price}`;
+      document.querySelectorAll("[data-period]").forEach((tab) => {
+        const active = tab.dataset.period === period;
+        tab.hidden = !getAvailablePremiumPeriods().includes(tab.dataset.period);
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-selected", String(active));
+      });
+    }
+
+    function openPremiumSheet() {
+      const membership = state.membership;
+      const availablePeriods = getAvailablePremiumPeriods();
+      const isPremium = availablePeriods.length !== 3;
+      const comparison = $(".premium-comparison");
+      const freeComparison = $("#premiumFreeComparison");
+      const memberFeatures = $("#premiumMemberFeatures");
+      const heading = $("#premiumSheetTitle");
+      const subtitle = $(".premium-subtitle");
+      const tabs = $("#premiumDurationTabs");
+
+      // [MODIFIED] Premium members see their included features, not a Free comparison.
+      comparison?.classList.remove("hidden");
+      freeComparison?.classList.toggle("hidden", isPremium);
+      memberFeatures?.classList.toggle("hidden", !isPremium);
+      heading.innerHTML = 'WAGRAM <span>Premium</span>';
+
+      if (isPremium) {
+        const expiry = membership?.plan_expires_at ? new Date(Number(membership.plan_expires_at)) : null;
+        const expiryText = expiry && !Number.isNaN(expiry.getTime())
+          ? "Aktif sampai " + expiry.toLocaleString("id-ID", { day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Makassar" }) + " WITA."
+          : "Masa Premium aktif.";
+        subtitle.textContent = expiryText + " Pilih durasi upgrade atau perpanjangan.";
+      } else {
+        subtitle.textContent = "Lebih banyak akses. Tanpa batasan yang mengganggu.";
+      }
+
+      tabs?.classList.toggle("premium-renewal-tabs", isPremium);
+      const initialPeriod = availablePeriods[0] || "3d";
+      renderPremiumPlan(initialPeriod);
+      setPage("premium");
+      tg?.BackButton?.show?.();
+    }
+
+    function closePremiumSheet() {
+      setPage("account");
+      tg?.BackButton?.show?.();
+    }
+
+    $("#premiumBackButton").addEventListener("click", closePremiumSheet);
+
+    $("#premiumDurationTabs").addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-period]");
+      if (tab && premiumPlans[tab.dataset.period]) renderPremiumPlan(tab.dataset.period);
+    });
+    // [MODIFIED] Request a server-generated QRIS order and render its raw payload.
+    $("#premiumContinueButton").addEventListener("click", async () => {
+      const plan = premiumPlans[selectedPremiumPeriod];
+      const button = $("#premiumContinueButton");
+      const canvas = $("#premiumPaymentQr");
+      const qrWrap = $("#premiumPaymentQrWrap");
+      const qrContext = canvas.getContext("2d");
+      button.disabled = true;
+      // [ADDED] Keep the logo hidden and show a loader until the QR image is drawn.
+      qrWrap?.classList.add("is-loading");
+      qrWrap?.classList.remove("is-ready");
+      qrContext?.clearRect(0, 0, canvas.width, canvas.height);
+      $("#premiumPaymentPlan").textContent = plan.label;
+      $("#premiumPaymentAmount").textContent = "Menyiapkan…";
+      $("#premiumPaymentUniqueCode").textContent = "Membuat pesanan pembayaran";
+      $("#premiumPaymentStatus").textContent = "Menghubungi server…";
+      $("#premiumPaymentModal").classList.remove("hidden");
+      document.body.classList.add("premium-payment-open");
+
+      try {
+        const result = await api("/premium/orders", {
+          method: "POST",
+          body: JSON.stringify({ period: selectedPremiumPeriod })
+        });
+        if (!result.rawQris || !result.qrDataUrl || !result.order?.amount) {
+          throw new Error("Server tidak mengirim data QRIS yang valid.");
+        }
+
+        const order = result.order;
+        activePremiumOrderId = order.id;
+        $("#premiumPaymentDownloadButton").disabled = false;
+        // [MODIFIED] Manual proof upload remains available while automatic detection continues polling.
+        $("#premiumPaymentPaidButton").disabled = false;
+        $("#premiumPaymentPaidButton").textContent = "Saya sudah bayar";
+        startPremiumPaymentTracking(order);
+        $("#premiumPaymentConfirmation").textContent = "";
+        $("#premiumPaymentAmount").textContent = new Intl.NumberFormat("id-ID", {
+          style: "currency",
+          currency: "IDR",
+          maximumFractionDigits: 0
+        }).format(order.amount);
+        $("#premiumPaymentUniqueCode").textContent = "Kode unik: " + order.uniqueCode;
+        const qrImage = new Image();
+        await new Promise((resolve, reject) => {
+          qrImage.onload = resolve;
+          qrImage.onerror = reject;
+          qrImage.src = result.qrDataUrl;
+        });
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(qrImage, 0, 0, canvas.width, canvas.height);
+        // [ADDED] Reveal the centered WAGRAM logo only after the QR canvas is ready.
+        qrWrap?.classList.remove("is-loading");
+        qrWrap?.classList.add("is-ready");
+        // [MODIFIED] The QR itself communicates readiness; avoid repeating it in a separate status line.
+        $("#premiumPaymentStatus").textContent = "";
+      } catch (error) {
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        // [ADDED] Never reveal the brand logo when QR rendering fails.
+        qrWrap?.classList.remove("is-loading", "is-ready");
+        activePremiumOrderId = null;
+        $("#premiumPaymentDownloadButton").disabled = true;
+        $("#premiumPaymentPaidButton").disabled = true;
+        $("#premiumPaymentAmount").textContent = "—";
+        $("#premiumPaymentUniqueCode").textContent = "";
+        $("#premiumPaymentStatus").textContent = error.message || "QRIS gagal dimuat.";
+      } finally {
+        button.disabled = false;
+      }
+    });
+    // [MODIFIED] Track the 15-minute server order and activate the UI when backend confirms payment.
+    let activePremiumOrderId = null;
+    let premiumPaymentPollTimer = null;
+    let premiumPaymentCountdownTimer = null;
+
+    function stopPremiumPaymentTracking() {
+      if (premiumPaymentPollTimer) clearInterval(premiumPaymentPollTimer);
+      if (premiumPaymentCountdownTimer) clearInterval(premiumPaymentCountdownTimer);
+      premiumPaymentPollTimer = null;
+      premiumPaymentCountdownTimer = null;
+    }
+
+    function startPremiumPaymentTracking(order) {
+      stopPremiumPaymentTracking();
+      const expiresAt = Number(order.expiresAt || 0);
+      const countdown = $("#premiumPaymentCountdown");
+      const updateCountdown = () => {
+        const remaining = Math.max(0, expiresAt - Date.now());
+        const totalSeconds = Math.ceil(remaining / 1000);
+        const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+        const seconds = String(totalSeconds % 60).padStart(2, "0");
+        countdown.textContent = remaining > 0
+          ? "Bayar dalam " + minutes + ":" + seconds
+          : "Waktu pembayaran habis";
+        if (remaining <= 0) {
+          stopPremiumPaymentTracking();
+          $("#premiumPaymentStatus").textContent = "QRIS kedaluwarsa. Silakan buat pesanan baru.";
+          $("#premiumPaymentPaidButton").textContent = "Pesanan kedaluwarsa";
+          $("#premiumPaymentDownloadButton").disabled = true;
+        }
+      };
+
+      updateCountdown();
+      premiumPaymentCountdownTimer = setInterval(updateCountdown, 1000);
+
+      const checkPayment = async () => {
+        if (!activePremiumOrderId) return;
+        try {
+          const result = await api("/premium/orders/" + encodeURIComponent(activePremiumOrderId) + "/status");
+          if (result.order?.status === "approved") {
+            stopPremiumPaymentTracking();
+            $("#premiumPaymentQrWrap").classList.add("is-paid");
+            $("#premiumPaymentStatus").textContent = "Pembayaran berhasil";
+            $("#premiumPaymentCountdown").textContent = "Pembayaran diterima";
+            $("#premiumPaymentPaidButton").textContent = "✓ Pembayaran berhasil";
+            $("#premiumPaymentConfirmation").textContent = "Premium sudah aktif.";
+            activePremiumOrderId = null;
+            setTimeout(() => {
+              closePremiumPaymentModal();
+              setPage("chats");
+              tg?.BackButton?.hide?.();
+            }, 1400);
+            return;
+          }
+          if (result.order?.status === "expired" || Number(result.order?.expiresAt || 0) <= Date.now()) {
+            stopPremiumPaymentTracking();
+            $("#premiumPaymentStatus").textContent = "QRIS kedaluwarsa. Silakan buat pesanan baru.";
+            $("#premiumPaymentCountdown").textContent = "Waktu pembayaran habis";
+            $("#premiumPaymentPaidButton").textContent = "Pesanan kedaluwarsa";
+            $("#premiumPaymentDownloadButton").disabled = true;
+          }
+        } catch (error) {
+          console.warn("Premium payment status check failed:", error?.message || error);
+        }
+      };
+
+      checkPayment();
+      premiumPaymentPollTimer = setInterval(checkPayment, 2500);
+    }
+    const downloadPremiumQr = async () => {
+      const sourceCanvas = $("#premiumPaymentQr");
+      const exportCanvas = document.createElement("canvas");
+      exportCanvas.width = sourceCanvas.width;
+      exportCanvas.height = sourceCanvas.height;
+      const context = exportCanvas.getContext("2d");
+
+      if (!context || !sourceCanvas.width || !sourceCanvas.height) {
+        throw new Error("Gambar QRIS belum siap diunduh.");
+      }
+
+      // [MODIFIED] Export the QR and centered WAGRAM logo as a single PNG.
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+      context.drawImage(sourceCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
+
+      const logo = $("#premiumPaymentModal .premium-payment-logo");
+      if (logo?.complete && logo.naturalWidth > 0) {
+        const tileSize = Math.round(exportCanvas.width * 0.207);
+        const tileX = Math.round((exportCanvas.width - tileSize) / 2);
+        const tileY = Math.round((exportCanvas.height - tileSize) / 2);
+        const radius = Math.round(tileSize * 0.18);
+        const logoPadding = Math.round(tileSize * 0.12);
+
+        context.save();
+        context.beginPath();
+        if (typeof context.roundRect === "function") {
+          context.roundRect(tileX, tileY, tileSize, tileSize, radius);
+        } else {
+          context.rect(tileX, tileY, tileSize, tileSize);
+        }
+        context.fillStyle = "#092016";
+        context.fill();
+        context.lineWidth = Math.max(2, Math.round(exportCanvas.width * 0.01));
+        context.strokeStyle = "#ffffff";
+        context.stroke();
+        context.drawImage(
+          logo,
+          tileX + logoPadding,
+          tileY + logoPadding,
+          tileSize - logoPadding * 2,
+          tileSize - logoPadding * 2
+        );
+        context.restore();
+      }
+
+      // [MODIFIED] Use Telegram's native file download API instead of a WebView blob download.
+      const imageData = exportCanvas.toDataURL("image/png");
+      const prepared = await api("/premium/orders/" + encodeURIComponent(activePremiumOrderId) + "/qr-download", {
+        method: "POST",
+        body: JSON.stringify({ imageData })
+      });
+      if (!prepared.downloadUrl) throw new Error("Server tidak menyiapkan file QRIS.");
+
+      const downloadUrl = new URL(prepared.downloadUrl, new URL(API_BASE, window.location.href)).toString();
+      if (tg?.downloadFile && (!tg.isVersionAtLeast || tg.isVersionAtLeast("8.0"))) {
+        tg.downloadFile({
+          url: downloadUrl,
+          file_name: "WAGRAM-Premium-QRIS.png"
+        }, (accepted) => {
+          $("#premiumPaymentStatus").textContent = accepted
+            ? "Download QRIS dimulai."
+            : "Download QRIS dibatalkan.";
+        });
+        return;
+      }
+
+      // [ADDED] Fallback for older Telegram clients: open the attachment URL in the browser.
+      if (tg?.openLink) {
+        tg.openLink(downloadUrl);
+      } else {
+        window.location.href = downloadUrl;
+      }
+    };
+
+    $("#premiumPaymentDownloadButton").addEventListener("click", async () => {
+      if (!activePremiumOrderId) {
+        $("#premiumPaymentStatus").textContent = "QRIS belum siap diunduh.";
+        return;
+      }
+      const button = $("#premiumPaymentDownloadButton");
+      const originalLabel = button.textContent;
+      button.disabled = true;
+      button.textContent = "Menyiapkan gambar…";
+      try {
+        await downloadPremiumQr();
+        $("#premiumPaymentStatus").textContent = "Gambar QRIS siap disimpan.";
+      } catch (error) {
+        if (error?.name !== "AbortError") {
+          $("#premiumPaymentStatus").textContent = error.message || "Gagal mengunduh QRIS.";
+        }
+      } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+    });
+
+    // [ADDED] Require an image proof before the user can report a Premium payment.
+    let selectedPremiumProof = null; // [MODIFIED] Stores compressed image Blob, not Base64.
+    let selectedPremiumProofName = ""; // [ADDED]
+    let proofReadToken = 0; // [ADDED]
+    const proofModal = $("#premiumProofModal");
+    const proofInput = $("#premiumProofInput");
+    const proofPreviewLoading = $("#premiumProofPreviewLoading"); // [ADDED]
+    const proofConfirmButton = $("#premiumProofConfirmButton");
+
+    function showPremiumProofInlineError(message) { // [ADDED]
+      const errorBox = $("#premiumProofError");
+      errorBox.textContent = message;
+      errorBox.classList.remove("hidden");
+    }
+
+    $("#premiumPaymentPaidButton").addEventListener("click", () => {
+      if (!activePremiumOrderId) return;
+      selectedPremiumProof = null;
+      selectedPremiumProofName = ""; // [ADDED]
+      $("#premiumProofFileName").textContent = "Belum ada file dipilih"; // [ADDED]
+      $("#premiumProofFileSize").textContent = "JPG, PNG, atau WEBP · Maks. 5 MB"; // [ADDED]
+      $("#premiumProofPlaceholder").classList.remove("has-file"); // [ADDED]
+      proofReadToken += 1; // [ADDED]
+      proofInput.value = "";
+      proofPreviewLoading.classList.add("hidden"); // [ADDED]
+      proofConfirmButton.disabled = true;
+      proofModal.classList.remove("is-uploading"); // [ADDED]
+      proofInput.disabled = false; // [ADDED]
+      $("#premiumProofUploadState").classList.add("hidden"); // [ADDED]
+      $("#premiumProofUploadState").setAttribute("aria-hidden", "true"); // [ADDED]
+      proofModal.removeAttribute("aria-busy"); // [ADDED]
+      $("#premiumProofError").textContent = "";
+      $("#premiumProofError").classList.add("hidden"); // [ADDED]
+      $("#premiumProofFileName").textContent = "Belum ada file dipilih"; // [ADDED]
+      $("#premiumProofFileSize").textContent = "JPG, PNG, atau WEBP · Maks. 5 MB"; // [ADDED]
+      $("#premiumProofPlaceholder").classList.remove("has-file"); // [ADDED]
+      proofModal.classList.remove("hidden");
+    });
+
+    proofInput.addEventListener("change", async () => {
+      const file = proofInput.files?.[0] || null;
+      const readToken = ++proofReadToken; // [MODIFIED]
+      selectedPremiumProof = null;
+      selectedPremiumProofName = "";
+      proofConfirmButton.disabled = true;
+      proofPreviewLoading.classList.add("hidden");
+      $("#premiumProofError").textContent = "";
+      $("#premiumProofError").classList.add("hidden");
+      if (!file) {
+        $("#premiumProofFileName").textContent = "Belum ada file dipilih";
+        $("#premiumProofFileSize").textContent = "JPG, PNG, atau WEBP · Maks. 5 MB";
+        $("#premiumProofPlaceholder").classList.remove("has-file");
+        return;
+      }
+      if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+        showPremiumProofInlineError("Format file tidak didukung. Pilih JPG, PNG, atau WEBP.");
+        proofInput.value = "";
+        return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        showPremiumProofInlineError("File melebihi batas 5 MB. Pilih file yang lebih kecil.");
+        proofInput.value = "";
+        return;
+      }
+
+      // [MODIFIED] Keep original file bytes; avoid Canvas re-encoding that can produce blank images in Android WebView.
+      try {
+        const imageBuffer = await file.arrayBuffer();
+        if (readToken !== proofReadToken) return;
+        if (!imageBuffer.byteLength) throw new Error("File gambar kosong. Pilih ulang bukti pembayaran.");
+        selectedPremiumProof = new Blob([imageBuffer], { type: file.type });
+        selectedPremiumProofName = file.name || "bukti-pembayaran";
+        $("#premiumProofFileName").textContent = selectedPremiumProofName;
+        $("#premiumProofFileSize").textContent = (file.size / 1024).toFixed(0) + " KB · Siap dikirim";
+        $("#premiumProofPlaceholder").classList.add("has-file");
+        proofConfirmButton.disabled = false;
+      } catch (error) {
+        if (readToken !== proofReadToken) return;
+        selectedPremiumProof = null;
+        selectedPremiumProofName = "";
+        showPremiumProofInlineError(error.message || "Gambar gagal dibaca.");
+      } finally {
+        if (readToken === proofReadToken) proofPreviewLoading.classList.add("hidden");
+      }
+    });
+
+        $("#premiumProofCancelButton").addEventListener("click", () => {
+      if (proofModal.classList.contains("is-uploading")) return; // [ADDED]
+      proofModal.classList.add("hidden");
+      selectedPremiumProof = null;
+      proofReadToken += 1; // [ADDED]
+    });
+
+    proofModal.addEventListener("click", (event) => {
+      if (event.target === proofModal && !proofModal.classList.contains("is-uploading")) { // [MODIFIED]
+        proofModal.classList.add("hidden");
+        selectedPremiumProof = null;
+        proofReadToken += 1; // [ADDED]
+      }
+    });
+
+    proofConfirmButton.addEventListener("click", async () => {
+      if (!activePremiumOrderId || !selectedPremiumProof) return;
+      const paidButton = $("#premiumPaymentPaidButton");
+      proofConfirmButton.disabled = true;
+      $("#premiumProofCancelButton").disabled = true;
+      proofInput.disabled = true; // [ADDED]
+      proofModal.classList.add("is-uploading"); // [ADDED]
+      proofModal.setAttribute("aria-busy", "true"); // [ADDED]
+      $("#premiumProofUploadState").classList.remove("hidden"); // [ADDED]
+      $("#premiumProofUploadState").setAttribute("aria-hidden", "false"); // [ADDED]
+      proofConfirmButton.textContent = "Mengirim…";
+      $("#premiumProofError").textContent = "";
+      try {
+        await api("/premium/orders/" + encodeURIComponent(activePremiumOrderId) + "/paid", {
+          method: "POST",
+          body: selectedPremiumProof, // [MODIFIED] Send raw image bytes, not Base64 JSON.
+          contentType: "application/octet-stream" // [MODIFIED] Send original image bytes without conversion.
+        });
+        proofModal.classList.add("hidden");
+        selectedPremiumProof = null; // [ADDED] Release the selected proof after successful submission.
+        selectedPremiumProofName = ""; // [ADDED]
+        closePremiumPaymentModal(); // [ADDED] Close the QRIS payment dialog after admin notification succeeds.
+        activePremiumOrderId = null; // [ADDED] Clear the completed order from the active payment flow.
+        paidButton.disabled = true;
+        paidButton.textContent = "Konfirmasi terkirim";
+        $("#premiumPaymentConfirmation").textContent = "Bukti pembayaran terkirim. Premium aktif setelah diverifikasi admin.";
+        setPage("chats"); // [ADDED] Return to the main Chats page after successful submission.
+        tg?.BackButton?.hide?.(); // [ADDED] Reset Telegram's back button on the main page.
+      } catch (error) {
+        const errorBox = $("#premiumProofError"); // [ADDED]
+        const statusCode = Number(error?.status || 0); // [ADDED]
+        const errorTitle = statusCode === 413
+          ? "Ukuran permintaan terlalu besar"
+          : statusCode === 502
+            ? "Bukti belum berhasil diteruskan"
+            : statusCode >= 500
+              ? "Server sedang mengalami kendala"
+              : "Bukti pembayaran gagal dikirim";
+        const errorDescription = statusCode === 413
+          ? "Server atau proxy menolak data gambar yang dikirim. Coba gunakan screenshot yang sudah dipotong atau beresolusi lebih kecil. Jika tetap terjadi, batas ukuran request di server perlu diperiksa."
+          : statusCode === 502
+            ? "Bukti mungkin sudah diterima sistem, tetapi notifikasi ke admin gagal. Periksa status pesanan sebelum mengirim ulang."
+            : statusCode >= 500
+              ? "Terjadi kendala saat memproses bukti pembayaran. Tunggu sebentar lalu coba lagi."
+              : (error?.message || "Periksa koneksi dan file bukti pembayaran, lalu coba lagi.");
+        errorBox.innerHTML = `<div class="premium-proof-error-card" role="alert">
+          <span class="premium-proof-error-icon" aria-hidden="true">!</span>
+          <div class="premium-proof-error-copy">
+            <strong>${escapeHTML(errorTitle)}</strong>
+            <span>${escapeHTML(errorDescription)}</span>
+            <small>${statusCode ? `Kode kesalahan: HTTP ${statusCode}` : "Silakan coba kembali."}</small>
+          </div>
+        </div>`; // [ADDED]
+        errorBox.classList.remove("hidden"); // [ADDED]
+      } finally {
+        proofModal.classList.remove("is-uploading"); // [ADDED]
+        proofModal.removeAttribute("aria-busy"); // [ADDED]
+        $("#premiumProofUploadState").classList.add("hidden"); // [ADDED]
+        $("#premiumProofUploadState").setAttribute("aria-hidden", "true"); // [ADDED]
+        proofInput.disabled = false; // [ADDED]
+        proofConfirmButton.disabled = !selectedPremiumProof;
+        $("#premiumProofCancelButton").disabled = false;
+        proofConfirmButton.textContent = "Confirm";
+      }
+    });
+
+    // [MODIFIED] Close the payment dialog without navigating away from Premium.
+    function closePremiumPaymentModal() {
+      stopPremiumPaymentTracking();
+      $("#premiumPaymentModal").classList.add("hidden");
+      document.body.classList.remove("premium-payment-open");
+    }
+    $("#premiumPaymentBackButton").addEventListener("click", closePremiumPaymentModal);
+    $("#premiumPaymentModal").addEventListener("click", (event) => {
+      if (event.target === $("#premiumPaymentModal")) closePremiumPaymentModal();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !$("#premiumPaymentModal").classList.contains("hidden")) {
+        closePremiumPaymentModal();
+      }
+    });
+
+    // [MODIFIED] The primary session's chevron opens only that session's settings.
+    $("#whatsappControlsToggle").addEventListener("click", async () => {
+      // [MODIFIED] The primary-row dropdown belongs to the primary account and never changes selection.
+      const primary = state.whatsappSessions.find((item) => item.is_primary);
+      const sessionId = primary?.session_id;
+      if (!sessionId) return;
+      state.expandedSettingsSessionId = state.expandedSettingsSessionId === sessionId ? null : sessionId;
+      mountWhatsAppSessionSettings();
+      renderNotificationPreferences();
+    });
+
+    // [MODIFIED] Notification preferences remain inside the settings panel of their owning session.
+    $("#whatsappAccountControls").addEventListener("click", (event) => {
+      const toggle = event.target.closest("#notificationCardToggle");
+      if (!toggle) return;
+      const section = toggle.closest(".embedded-notification-section");
+      const collapsed = section.classList.toggle("is-collapsed");
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+    });
+
+
+    // [ADDED] Confirm each cleanup action before deleting account-owned records.
+    $("#historyCleanupOptions").addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-cleanup]");
+      if (!button || button.disabled) return;
+
+      const type = button.dataset.cleanup;
+      const confirmations = {
+        media: "Hapus semua media tersimpan? Pesan teks dan riwayat chat tetap ada.",
+        messages: "Hapus seluruh riwayat pesan? Daftar chat tetap ada, tetapi isi percakapan tidak dapat dipulihkan.",
+        calls: "Hapus seluruh riwayat panggilan? Tindakan ini tidak dapat dibatalkan.",
+        contacts: "Hapus semua kontak manual yang tersimpan di WAGRAM? Tindakan ini tidak dapat dibatalkan.",
+        cache: "Bersihkan cache media sementara di perangkat ini?"
+      };
+
+      if (!confirmations[type]) return;
+      if (!(await confirmAction(confirmations[type]))) return;
+
+      button.disabled = true;
+      try {
+        if (type === "cache") {
+          clearMediaCache();
+          showToast("Cache media sementara berhasil dibersihkan.");
+          return;
+        }
+
+        const cleanupSessionId = state.activeSessionId;
+        const result = await api("/data/cleanup", {
+          method: "POST",
+          body: JSON.stringify({ type }),
+          headers: cleanupSessionId ? { "X-WAGRAM-Session-ID": cleanupSessionId } : {}
+        });
+
+        clearMediaCache();
+
+        if (type === "messages") {
+          state.chatsLoaded = false;
+          state.chats = [];
+          if (state.page === "chats") loadChats();
+        } else if (type === "calls") {
+          state.callsLoaded = false;
+          state.calls = [];
+          if (state.page === "calls") loadCalls();
+        } else if (type === "contacts") {
+          state.contactsLoaded = false;
+          state.contacts = [];
+          if (state.page === "contacts") loadContacts();
+        }
+
+        const count = Number(result.deleted || 0);
+        const names = {
+          media: "media",
+          messages: "pesan",
+          calls: "riwayat panggilan",
+          contacts: "kontak"
+        };
+        showToast(count > 0
+          ? `${count} data ${names[type]} berhasil dihapus.`
+          : `Tidak ada ${names[type]} yang perlu dihapus.`);
+      } catch (error) {
+        showToast(error.message || "Penghapusan data gagal.");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    // [ADDED] Expand or collapse the history and data cleanup list.
+    $("#historyCleanupToggle").addEventListener("click", () => {
+      const section = $("#historyCleanupToggle").closest(".embedded-history-section");
+      const collapsed = section.classList.toggle("is-collapsed");
+      $("#historyCleanupToggle").setAttribute("aria-expanded", String(!collapsed));
+    });
+
+    // [MODIFIED] Profile switch controls server-side WhatsApp Auto Reply only.
+    $("#aiBusinessToggle")?.addEventListener("click", toggleAIBusinessPreference);
+
+    // [ADDED] Notification switches are saved locally on this device.
+    $("#notificationOptions").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-notification]");
+      if (!button) return;
+      const key = button.dataset.notification;
+      if (!isPremiumMembership() && isPremiumNotification(key)) {
+        openPremiumSheet();
+        return;
+      }
+      toggleNotificationPreference(button);
+    });
+
+    // [MODIFIED] Pair the currently selected WhatsApp session.
+    $("#accountWhatsAppState").addEventListener("click", async () => {
+      const button = $("#accountWhatsAppState");
+      if (button.disabled) return;
+      button.disabled = true;
+      button.classList.add("is-connecting");
+      button.innerHTML = "<i></i> Connecting…";
+      try {
+        await api("/sessions/" + enc(state.activeSessionId) + "/connect", { method: "POST" });
+        await showWhatsAppSessionQr(state.activeSessionId);
+        await loadWhatsAppAccount();
+      } catch (error) { showToast(error.message); await loadWhatsAppAccount(); }
+    });
+
+    // [ADDED] Restore the profile status only after the pairing flow confirms success.
+    window.addEventListener("wagram:connected", () => {
+      loadWhatsAppAccount();
+    });
+
+    // [ADDED] Disconnect the currently linked WhatsApp session.
+    $("#disconnectWhatsAppButton").addEventListener("click", async () => {
+      if (!window.confirm("Putuskan koneksi WhatsApp dari WAGRAM?")) return;
+      const button = $("#disconnectWhatsAppButton");
+      button.disabled = true;
+      try {
+        await api("/sessions/" + enc(state.activeSessionId) + "/disconnect", { method: "POST", body: JSON.stringify({}) });
+        showToast("WhatsApp berhasil diputuskan.");
+        await loadWhatsAppAccount();
+      } catch (error) {
+        showToast(error.message);
+        await loadWhatsAppAccount();
+      }
+    });
+
+    window.matchMedia?.("(prefers-color-scheme: dark)")
+      .addEventListener?.("change", applyTheme);
+
+    // Foto & video
+    const messageList = $("#messageList");
+
+    messageList.addEventListener("scroll", () => {
+      nearBottom =
+        messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 200;
+    });
+
+    messageList.addEventListener("click", (event) => {
+      // [ADDED] Open the current conversation in WhatsApp; the View Once media remains protected.
+      const viewOnceButton = event.target.closest("[data-view-once-open]");
+      if (viewOnceButton) {
+        event.stopPropagation();
+        const phone = state.currentChat?.phone_number;
+        if (!phone) {
+          showToast("Buka percakapan ini langsung dari WhatsApp untuk melihat media sekali lihat.");
+          return;
+        }
+        openWhatsApp(phone);
+        return;
+      }
+
+      const profile = event.target.closest("[data-profile-jid]");
+      if (profile) {
+        openProfile(profile.dataset.profileJid, profile.dataset.profileName);
+        return;
+      }
+
+      const editedMessage = event.target.closest(".message-history-group[data-edit-expandable='true']");
+      if (editedMessage) {
+        editedMessage.classList.toggle("show-original");
+        return;
+      }
+
+      const img = event.target.closest("[data-media-img]");
+
+      if (img) {
+        if (img.getAttribute("src") && !img.closest(".sticker")) {
+          openLightbox(img.src);
+        }
+
+        return;
+      }
+
+      const video = event.target.closest("[data-media-video]");
+
+      if (video) {
+        playVideo(video);
+        return;
+      }
+
+      const audio = event.target.closest("[data-media-audio]");
+      if (audio) {
+        playAudio(audio);
+        return;
+      }
+
+      const documentFile = event.target.closest("[data-media-document]");
+      if (documentFile) openDocument(documentFile);
+    });
+
+    $("#lightbox").addEventListener("click", closeLightbox);
+    // [MODIFIED] Save the current chat number to WAGRAM contacts.
+    $("#saveChatContactButton").addEventListener("click", () => {
+      const chat = state.currentChat;
+      if (!chat?.phone_number) {
+        showToast("Nomor telepon tidak tersedia.");
+        return;
+      }
+      openContactSheet(null, {
+        name: chatName(chat),
+        phone: chat.phone_number
+      });
+    });
+
+    // [MODIFIED] Open a direct WhatsApp conversation with this contact.
+    $("#openChatWhatsAppButton").addEventListener("click", () => {
+      const chat = state.currentChat;
+      if (!chat?.phone_number) {
+        showToast("Nomor telepon tidak tersedia.");
+        return;
+      }
+      openWhatsApp(chat.phone_number);
+    });
+
+    $("#messagesNav").addEventListener("click", () => setPage("chats"));
+    $("#callsNav").addEventListener("click", () => setPage("calls"));
+    $("#contactsNav").addEventListener("click", () => setPage("contacts"));
+    $("#profileNav").addEventListener("click", () => setPage("account"));
+    updateTopbarTitle();
+    $("#backToMessagesCalls").addEventListener("click", () => setPage("chats"));
+    $("#backToMessagesContacts").addEventListener("click", () => setPage("chats"));
+
+    // Chat
+    $("#searchInput").addEventListener("input", onChatSearch);
+
+    $("#chatFilters").addEventListener("click", (event) => {
+      const chip = event.target.closest("[data-filter]");
+
+      if (!chip) return;
+
+      const wasArchived = state.filter === "archived";
+
+      state.filter = chip.dataset.filter;
+
+      document.querySelectorAll("#chatFilters .chip").forEach((item) => {
+        item.classList.toggle("active", item === chip);
+      });
+
+      // Arsip memakai data berbeda dari daftar utama.
+      if (wasArchived !== (state.filter === "archived")) {
+        state.chatsLoaded = false;
+        loadChats();
+      } else {
+        renderChats();
+      }
+    });
+
+    // [MODIFIED] Chat rows support long-press and left-swipe to reveal one archive action.
+    let chatPressTimer = null;
+    let chatPointerStart = null;
+    let suppressChatClick = false;
+
+    $("#chatList").addEventListener("pointerdown", (event) => {
+      const row = event.target.closest(".chat-swipe-row");
+      if (!row || event.target.closest("button[data-archive-chat]")) return;
+
+      chatPointerStart = { row, x: event.clientX, y: event.clientY, revealed: row.classList.contains("is-revealed") };
+      clearTimeout(chatPressTimer);
+      chatPressTimer = setTimeout(() => {
+        row.classList.add("is-revealed");
+        suppressChatClick = true;
+      }, 430);
+    });
+
+    $("#chatList").addEventListener("pointermove", (event) => {
+      if (!chatPointerStart) return;
+      const dx = event.clientX - chatPointerStart.x;
+      const dy = event.clientY - chatPointerStart.y;
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+        clearTimeout(chatPressTimer);
+        return;
+      }
+      if (dx < -38) {
+        clearTimeout(chatPressTimer);
+        chatPointerStart.row.classList.add("is-revealed");
+        suppressChatClick = true;
+      } else if (dx > 38 && chatPointerStart.revealed) {
+        clearTimeout(chatPressTimer);
+        chatPointerStart.row.classList.remove("is-revealed");
+        suppressChatClick = true;
+      }
+    });
+
+    const finishChatPointer = () => {
+      clearTimeout(chatPressTimer);
+      chatPressTimer = null;
+      chatPointerStart = null;
+    };
+    $("#chatList").addEventListener("pointerup", finishChatPointer);
+    $("#chatList").addEventListener("pointercancel", finishChatPointer);
+
+    $("#wagramAiPinnedRow")?.addEventListener("click", () => {
+      if (!isAIBusinessEligible()) {
+        openPremiumSheet();
+        return;
+      }
+      setPage("aiBusiness");
+    });
+
+    $("#chatList").addEventListener("click", (event) => {
+      const favorite = event.target.closest("[data-favorite-chat]");
+      if (favorite) {
+        event.stopPropagation();
+        toggleFavoriteFromList(favorite.dataset.favoriteChat, favorite);
+        return;
+      }
+
+      const archive = event.target.closest("[data-archive-chat]");
+      if (archive) {
+        event.stopPropagation();
+        archiveChatFromList(archive.dataset.archiveChat, archive);
+        return;
+      }
+
+      const row = event.target.closest("[data-chat]");
+      if (!row) return;
+
+      if (row.dataset.premiumChat === "true") {
+        event.preventDefault();
+        openPremiumSheet();
+        return;
+      }
+
+      const wrapper = row.closest(".chat-swipe-row");
+      if (suppressChatClick) {
+        suppressChatClick = false;
+        return;
+      }
+      if (wrapper?.classList.contains("is-revealed")) {
+        wrapper.classList.remove("is-revealed");
+        return;
+      }
+      openChat(row.dataset.chat);
+    });
+
+    // [ADDED] Open the active chat or group profile from its header.
+    $("#conversationHeader").addEventListener("click", (event) => {
+      const target = event.target.closest("[data-profile-jid]");
+      if (target) openProfile(target.dataset.profileJid, target.dataset.profileName, state.currentChat?.phone_number || "");
+    });
+
+    // Panggilan
+    $("#callsSearchInput").addEventListener("input", (event) => {
+      state.callSearch = event.target.value;
+      renderCalls();
+    });
+
+    $("#callFilters").addEventListener("click", (event) => {
+      const chip = event.target.closest("[data-call-filter]");
+
+      if (!chip) return;
+
+      state.callFilter = chip.dataset.callFilter;
+
+      document.querySelectorAll("#callFilters .chip").forEach((item) => {
+        item.classList.toggle("active", item === chip);
+      });
+
+      renderCalls();
+    });
+
+    // [MODIFIED] Call cards reveal favorite and archive actions on long-press or left-swipe.
+    let callPressTimer = null;
+    let callPointerStart = null;
+    let suppressCallClick = false;
+
+    $("#callsList").addEventListener("pointerdown", (event) => {
+      const row = event.target.closest(".call-swipe-row");
+      if (!row || event.target.closest("button")) return;
+      callPointerStart = { row, x: event.clientX, y: event.clientY, revealed: row.classList.contains("is-revealed") };
+      clearTimeout(callPressTimer);
+      callPressTimer = setTimeout(() => { row.classList.add("is-revealed"); suppressCallClick = true; }, 430);
+    });
+
+    $("#callsList").addEventListener("pointermove", (event) => {
+      if (!callPointerStart) return;
+      const dx = event.clientX - callPointerStart.x;
+      const dy = event.clientY - callPointerStart.y;
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) { clearTimeout(callPressTimer); return; }
+      if (dx < -38) {
+        clearTimeout(callPressTimer);
+        callPointerStart.row.classList.add("is-revealed");
+        suppressCallClick = true;
+      } else if (dx > 38 && callPointerStart.revealed) {
+        clearTimeout(callPressTimer);
+        callPointerStart.row.classList.remove("is-revealed");
+        suppressCallClick = true;
+      }
+    });
+
+    const finishCallPointer = () => { clearTimeout(callPressTimer); callPressTimer = null; callPointerStart = null; };
+    $("#callsList").addEventListener("pointerup", finishCallPointer);
+    $("#callsList").addEventListener("pointercancel", finishCallPointer);
+
+    // [MODIFIED] Call favorite/archive actions update the call record itself, never a WhatsApp chat.
+    async function updateCallAction(callId, action) {
+      const call = state.calls.find((item) => String(item.id) === String(callId));
+      if (!call) return;
+
+      try {
+        if (action === "favorite") {
+          const favorite = !Boolean(call.is_favorite);
+          await api(`/calls/${enc(callId)}/favorite`, {
+            method: "PUT",
+            body: JSON.stringify({ favorite })
+          });
+          showToast(favorite ? "Panggilan ditambahkan ke favorit" : "Panggilan dihapus dari favorit");
+        } else {
+          await api(`/calls/${enc(callId)}/archive`, {
+            method: "PUT",
+            body: JSON.stringify({ archived: true })
+          });
+          showToast("Riwayat panggilan diarsipkan");
+        }
+        await loadCalls();
+      } catch (error) {
+        showToast(error.message);
+      }
+    }
+
+    $("#callsList").addEventListener("click", async (event) => {
+      const save = event.target.closest("[data-save-call]");
+      if (save) {
+        event.stopPropagation();
+        const call = state.calls.find((item) => String(item.id) === save.dataset.saveCall);
+        if (!call?.phone_number) { showToast("Nomor telepon tidak tersedia."); return; }
+
+        // [MODIFIED] The same person-plus action opens add or edit contact, even when already saved.
+        if (!state.contactsLoaded) await loadContacts();
+        const digits = String(call.phone_number).replace(/\D/g, "");
+        const contact = state.contacts.find((item) =>
+          String(item.phone_number || "").replace(/\D/g, "") === digits
+        );
+        openContactSheet(contact || null, {
+          name: contact?.name || call.display_name,
+          phone: call.phone_number
+        });
+        return;
+      }
+      const favorite = event.target.closest("[data-call-favorite]");
+      if (favorite) { event.stopPropagation(); updateCallAction(favorite.dataset.callFavorite, "favorite"); return; }
+      const archive = event.target.closest("[data-call-archive]");
+      if (archive) { event.stopPropagation(); updateCallAction(archive.dataset.callArchive, "archive"); return; }
+      const row = event.target.closest(".call-swipe-row");
+      if (!row) return;
+      if (suppressCallClick) { suppressCallClick = false; return; }
+      if (row.classList.contains("is-revealed")) row.classList.remove("is-revealed");
+    });
+
+    // [MODIFIED] Add action follows the selected directory.
+    $("#addContactButton").addEventListener("click", () => {
+      if (state.contactTab === "customers") openCustomerContactSheet();
+      else if (state.contactTab === "employees") openEmployeeWhitelistSheet();
+      else openContactSheet();
+    });
+    document.querySelectorAll("[data-contact-tab]").forEach((b) => b.addEventListener("click", () => setContactTab(b.dataset.contactTab)));
+    $("#customerContactsSearchInput").addEventListener("input", renderCustomerContacts);
+    $("#employeeWhitelistSearchInput").addEventListener("input", renderEmployeeWhitelist);
+    $("#customerContactForm").addEventListener("submit", submitCustomerContact);
+    $("#employeeWhitelistForm").addEventListener("submit", submitEmployeeWhitelist);
+    $("#customerContactSheet").addEventListener("click", (e) => { if (e.target.closest("[data-close-customer-sheet]")) closeCustomerContactSheet(); });
+    $("#employeeWhitelistSheet").addEventListener("click", (e) => { if (e.target.closest("[data-close-employee-sheet]")) closeEmployeeWhitelistSheet(); });
+    $("#customerContactsList").addEventListener("click", (e) => {
+      const edit = e.target.closest("[data-customer-edit]");
+      const remove = e.target.closest("[data-customer-delete]");
+      if (edit) openCustomerContactSheet(state.customerContacts.find((c) => String(c.id) === edit.dataset.customerEdit));
+      if (remove) removeCustomerContact(remove.dataset.customerDelete);
+      if (e.target.closest("[data-add-customer]")) openCustomerContactSheet();
+    });
+    $("#employeeWhitelistList").addEventListener("click", (e) => {
+      const edit = e.target.closest("[data-employee-edit]");
+      const remove = e.target.closest("[data-employee-delete]");
+      if (edit) openEmployeeWhitelistSheet(state.employeeWhitelist.find((c) => String(c.id) === edit.dataset.employeeEdit));
+      if (remove) removeEmployeeWhitelist(remove.dataset.employeeDelete);
+      if (e.target.closest("[data-add-employee]")) openEmployeeWhitelistSheet();
+    });
+
+    $("#contactsSearchInput").addEventListener("input", (event) => {
+      state.contactSearch = event.target.value;
+      renderContacts();
+    });
+
+    // [ADDED] Contact cards reveal WhatsApp, Edit and Delete actions on long-press or left swipe.
+    let contactPressTimer = null;
+    let contactPointerStart = null;
+    let suppressContactClick = false;
+
+    $("#contactsList").addEventListener("pointerdown", (event) => {
+      const row = event.target.closest(".contact-swipe-row");
+      if (!row || event.target.closest("button")) return;
+      contactPointerStart = { row, x: event.clientX, y: event.clientY, revealed: row.classList.contains("is-revealed") };
+      clearTimeout(contactPressTimer);
+      contactPressTimer = setTimeout(() => {
+        row.classList.add("is-revealed");
+        suppressContactClick = true;
+      }, 430);
+    });
+
+    $("#contactsList").addEventListener("pointermove", (event) => {
+      if (!contactPointerStart) return;
+      const dx = event.clientX - contactPointerStart.x;
+      const dy = event.clientY - contactPointerStart.y;
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+        clearTimeout(contactPressTimer);
+        return;
+      }
+      if (dx < -38) {
+        clearTimeout(contactPressTimer);
+        contactPointerStart.row.classList.add("is-revealed");
+        suppressContactClick = true;
+      } else if (dx > 38 && contactPointerStart.revealed) {
+        clearTimeout(contactPressTimer);
+        contactPointerStart.row.classList.remove("is-revealed");
+        suppressContactClick = true;
+      }
+    });
+
+    const finishContactPointer = () => {
+      clearTimeout(contactPressTimer);
+      contactPressTimer = null;
+      contactPointerStart = null;
+    };
+    $("#contactsList").addEventListener("pointerup", finishContactPointer);
+    $("#contactsList").addEventListener("pointercancel", finishContactPointer);
+
+    $("#contactsList").addEventListener("click", (event) => {
+      if (event.target.closest("[data-add-contact]")) {
+        openContactSheet();
+        return;
+      }
+
+      const contactRow = event.target.closest(".contact-swipe-row");
+      if (contactRow && !event.target.closest("button")) {
+        if (suppressContactClick) {
+          suppressContactClick = false;
+          return;
+        }
+        if (contactRow.classList.contains("is-revealed")) contactRow.classList.remove("is-revealed");
+        return;
+      }
+
+      const wa = event.target.closest("[data-wa]");
+      const edit = event.target.closest("[data-edit]");
+      const del = event.target.closest("[data-del]");
+
+      if (wa) {
+        openWhatsApp(wa.dataset.wa);
+      } else if (edit) {
+        const contact = state.contacts.find(
+          (item) => String(item.id) === edit.dataset.edit
+        );
+
+        if (contact) openContactSheet(contact);
+      } else if (del) {
+        removeContact(del.dataset.del);
+      }
+    });
+
+    // Form kontak
+    $("#contactForm").addEventListener("submit", submitContact);
+
+    $("#contactSheet").addEventListener("click", (event) => {
+      if (event.target.closest("[data-close-sheet]")) closeContactSheet();
+    });
+
+    // [ADDED] Profile sheet dismissal.
+    $("#profileSheet").addEventListener("click", (event) => {
+      if (event.target.closest("[data-close-profile]")) closeProfileSheet();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+
+      if (!$("#lightbox").classList.contains("hidden")) {
+        closeLightbox();
+      } else if (!$("#profileSheet").classList.contains("hidden")) {
+        closeProfileSheet();
+      } else if (!$("#contactSheet").classList.contains("hidden")) {
+        closeContactSheet();
+      } else if (!$("#customerContactSheet").classList.contains("hidden")) {
+        closeCustomerContactSheet();
+      } else if (!$("#employeeWhitelistSheet").classList.contains("hidden")) {
+        closeEmployeeWhitelistSheet();
+      }
+    });
+  }
+
+  /* ---------------------------------------------------------
+     Telegram & tema
+     --------------------------------------------------------- */
+
+  const THEME_KEY = "wagram-theme";
+
+  function getThemePref() {
+    try {
+      const value = localStorage.getItem(THEME_KEY);
+
+      return ["auto", "light", "dark"].includes(value) ? value : "light";
+    } catch {
+      return "auto";
+    }
+  }
+
+  function setThemePref(value) {
+    try {
+      localStorage.setItem(THEME_KEY, value);
+    } catch {
+      /* penyimpanan tidak tersedia */
+    }
+
+    // [MODIFIED] Reveal the new theme with a centered expanding circle when View Transitions are supported.
+    const root = document.documentElement;
+    if (typeof document.startViewTransition === "function" && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      document.startViewTransition(() => applyTheme());
+    } else {
+      applyTheme();
+    }
+  }
+
+  // "auto" mengikuti tema Telegram, lalu tema perangkat. Default WAGRAM adalah tema terang.
+  function resolveScheme() {
+    const pref = getThemePref();
+
+    if (pref !== "auto") return pref;
+
+    if (tg?.colorScheme) return tg.colorScheme === "dark" ? "dark" : "light";
+
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+
+  function applyTheme() {
+    const scheme = resolveScheme();
+    const root = document.documentElement;
+
+    root.dataset.theme = scheme;
+
+    // Tombol tema: bulan saat terang (ketuk -> gelap), matahari saat gelap.
+    $("#themeButton").innerHTML = icon(scheme === "dark" ? "sun" : "moon");
+    $("#profileThemeButton").innerHTML = icon(scheme === "dark" ? "sun" : "moon");
+
+    const pref = getThemePref();
+
+
+
+    const background = getComputedStyle(root).getPropertyValue("--bg").trim();
+
+    $('meta[name="theme-color"]')?.setAttribute("content", background);
+
+    try {
+      tg?.setHeaderColor?.(background);
+      tg?.setBackgroundColor?.(background);
+    } catch {
+      /* versi Telegram lama */
+    }
+  }
+
+  function initTelegram() {
+    applyTheme();
+
+    if (!tg) return;
+
+    tg.ready();
+    tg.expand?.();
+    tg.onEvent?.("themeChanged", applyTheme);
+
+    tg.BackButton?.onClick(() => {
+      if (!$("#lightbox").classList.contains("hidden")) {
+        closeLightbox();
+      } else if (!$("#profileSheet").classList.contains("hidden")) {
+        closeProfileSheet();
+      } else if (!$("#contactSheet").classList.contains("hidden")) {
+        closeContactSheet();
+      } else if (!$("#customerContactSheet").classList.contains("hidden")) {
+        closeCustomerContactSheet();
+      } else if (!$("#employeeWhitelistSheet").classList.contains("hidden")) {
+        closeEmployeeWhitelistSheet();
+      } else if (state.page === "premium") {
+        closePremiumSheet();
+      } else {
+        setPage("chats");
+      }
+    });
+  }
+
+  // [ADDED] WebSocket realtime with a polling fallback for mobile WebViews/proxies.
+  let chatRefreshInFlight = false;
+  let realtimeSocket = null;
+  let realtimeRetryTimer = null;
+  let realtimeRetryDelay = 1000;
+  let realtimeRefreshTimer = null;
+  const pendingRealtimeChatIds = new Set();
+  let pendingCallsRefresh = false;
+  let pendingConnectionStatus = null;
+
+  function getMessageSignature(messages) {
+    return messages.map((message) => [
+      message.whatsapp_message_id,
+      message.message_timestamp,
+      message.body || "",
+      message.has_media ? 1 : 0,
+      message.media_file_name || ""
+    ].join(":")).join("|");
+  }
+
+  async function refreshOpenChat() {
+    const chatId = state.currentChat?.whatsapp_chat_id;
+    if (
+      !chatId ||
+      chatRefreshInFlight ||
+      document.visibilityState !== "visible"
+    ) {
+      return;
+    }
+
+    chatRefreshInFlight = true;
+
+    try {
+      const data = await api(`/chats/${enc(chatId)}/messages?limit=200`);
+
+      if (state.currentChat?.whatsapp_chat_id !== chatId) return;
+
+      const messages = data.messages || [];
+      const signature = getMessageSignature(messages);
+
+      if (signature !== state.currentChatMessageSignature) {
+        state.currentChatMessageSignature = signature;
+        state.currentChat = { ...state.currentChat, ...data.chat };
+        updateConversationHeader();
+        renderMessages(messages, { preservePosition: true });
+
+        // Messages received while this conversation is open are locally read.
+        await api(`/chats/${enc(chatId)}/read`, { method: "POST" });
+
+        if (state.currentChat?.whatsapp_chat_id === chatId) {
+          await loadChats();
+          const openedChat = state.chats.find(
+            (chat) => chat.whatsapp_chat_id === chatId
+          );
+          if (openedChat) openedChat.unread_count = 0;
+          state.chatCounts.unread = state.chats.filter(
+            (chat) => Number(chat.unread_count) > 0
+          ).length;
+          updateChatFilterCounts();
+          renderChats();
+          updateBottomNavBadges();
+        }
+      }
+    } catch (error) {
+      console.warn("Could not refresh open Mini App chat:", error.message);
+    } finally {
+      chatRefreshInFlight = false;
+    }
+  }
+
+  function scheduleRealtimeRefresh(event) {
+    // [MODIFIED] Connection updates for secondary accounts must refresh the whole session list.
+    if (event.type !== "connection.status" && event.data?.sessionId && state.activeSessionId && event.data.sessionId !== state.activeSessionId) return;
+    if (
+      event.type === "message.created" ||
+      event.type === "message.deleted" ||
+      event.type === "message.edited" ||
+      event.type === "media.ready"
+    ) {
+      if (event.data?.chatId) pendingRealtimeChatIds.add(event.data.chatId);
+    } else if (event.type === "calls.updated") {
+      pendingCallsRefresh = true;
+    } else if (event.type === "connection.status") {
+      pendingConnectionStatus = event.data?.status || null;
+    } else if (event.type === "membership.updated") {
+      // [MODIFIED] Refresh Premium access, then actively resume every eligible paused WhatsApp session.
+      loadMembership().then(async () => {
+        await loadWhatsAppSessions();
+
+        if (hasActivePremiumMembership()) {
+          const resumableSessions = (state.whatsappSessions || []).filter((session, index) => {
+            const status = session.status || session.connection_status || "disconnected";
+            return !session.is_primary && status === "paused" && index < state.whatsappSessionLimit;
+          });
+
+          // [ADDED] Resume through the authenticated session endpoint so every Premium activation
+          // path (automatic payment, admin approval, or admin plan update) behaves consistently.
+          await Promise.allSettled(resumableSessions.map((session) =>
+            api("/sessions/" + enc(session.session_id) + "/connect", { method: "POST" })
+          ));
+
+          // [ADDED] Refresh status and profile data after reconnect attempts have started.
+          await loadWhatsAppSessions();
+        }
+
+        if (state.page === "account") await loadWhatsAppAccount();
+        if (state.chatsLoaded) await loadChats();
+      }).catch((error) => showToast(error.message || "Status Premium gagal diperbarui."));
+    }
+
+    clearTimeout(realtimeRefreshTimer);
+    realtimeRefreshTimer = setTimeout(() => {
+      if (pendingRealtimeChatIds.size > 0) {
+        const chatIds = [...pendingRealtimeChatIds];
+        pendingRealtimeChatIds.clear();
+        loadChats();
+
+        const currentChatId = state.currentChat?.whatsapp_chat_id;
+        if (currentChatId && chatIds.includes(currentChatId)) {
+          refreshOpenChat();
+        }
+      }
+
+      if (pendingCallsRefresh) loadCalls();
+      pendingCallsRefresh = false;
+
+      if (pendingConnectionStatus) {
+        // [MODIFIED] Refresh the account panel once, or the session list on other pages.
+        if (state.page === "account") {
+          loadWhatsAppAccount().catch(() => {});
+        } else {
+          loadWhatsAppSessions().catch(() => {});
+        }
+        $("#connectionStatus").textContent = pendingConnectionStatus === "connected"
+          ? "WhatsApp terhubung"
+          : `WhatsApp ${pendingConnectionStatus}`;
+        pendingConnectionStatus = null;
+      }
+    }, 180);
+  }
+
+  function connectRealtime() {
+    if (!tg?.initData || typeof WebSocket === "undefined") return;
+    if (
+      realtimeSocket &&
+      [WebSocket.CONNECTING, WebSocket.OPEN].includes(realtimeSocket.readyState)
+    ) return;
+
+    clearTimeout(realtimeRetryTimer);
+
+    const apiUrl = new URL(API_BASE, window.location.href);
+    const socketUrl = new URL("/ws/miniapp", apiUrl.origin);
+    socketUrl.protocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+
+    const socket = new WebSocket(socketUrl.toString());
+    realtimeSocket = socket;
+
+    socket.addEventListener("open", () => {
+      realtimeRetryDelay = 1000;
+      socket.send(JSON.stringify({
+        type: "auth",
+        initData: tg.initData
+      }));
+    });
+
+    socket.addEventListener("message", (message) => {
+      try {
+        const event = JSON.parse(message.data);
+        if (event?.type && event.type !== "connected") {
+          scheduleRealtimeRefresh(event);
+        }
+      } catch {
+        /* abaikan payload WebSocket yang tidak valid */
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      if (realtimeSocket === socket) realtimeSocket = null;
+      if (document.visibilityState !== "visible") return;
+
+      realtimeRetryTimer = setTimeout(() => {
+        connectRealtime();
+      }, realtimeRetryDelay);
+
+      realtimeRetryDelay = Math.min(realtimeRetryDelay * 2, 30000);
+    });
+
+    socket.addEventListener("error", () => {
+      socket.close();
+    });
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState !== "visible") return;
+
+    connectRealtime();
+
+    // [ADDED] One database snapshot after returning from background.
+    if (state.chatsLoaded) loadChats();
+    if (state.callsLoaded) loadCalls();
+    loadMembership(); // [MODIFIED] Always refresh Premium access when returning to the Mini App.
+  }
+
+
+  // [ADDED] Show the two-step introduction once per Telegram account on this device.
+  const ONBOARDING_STORAGE_KEY = "wagram-onboarding-completed";
+  function initOnboarding() {
+    const overlay = $("#wagramOnboarding");
+    if (!overlay) return;
+
+    let completed = false;
+    let forcePreview = false; // [ADDED] Keep preview flag available after the try block.
+    try {
+      const telegramUserId = String(tg?.initDataUnsafe?.user?.id || "guest");
+      completed = localStorage.getItem(`${ONBOARDING_STORAGE_KEY}:${telegramUserId}`) === "1";
+      // [MODIFIED] Admin preview query bypasses the completed flag without resetting it.
+      forcePreview = new URLSearchParams(window.location.search).get("previewOnboarding") === "1";
+    } catch {
+      completed = false;
+    }
+
+    // [MODIFIED] Allow an explicit admin preview even when onboarding was already completed.
+    if (completed && !forcePreview) return;
+
+    const welcome = $("#onboardingWelcome");
+    const plans = $("#onboardingFeatures");
+    const dotOne = $("#onboardingDotOne");
+    const dotTwo = $("#onboardingDotTwo");
+
+    // [MODIFIED] Two-step onboarding: custom visual welcome followed by plan comparison.
+    const showStep = (step) => {
+      welcome.classList.toggle("hidden", step !== 1);
+      plans.classList.toggle("hidden", step !== 2);
+      dotOne.classList.toggle("active", step === 1);
+      dotTwo.classList.toggle("active", step === 2);
+    };
+
+    $("#onboardingNextButton")?.addEventListener("click", () => showStep(2));
+    $("#onboardingBackButton")?.addEventListener("click", () => showStep(1));
+    $("#onboardingFinishButton")?.addEventListener("click", () => {
+      try {
+        const telegramUserId = String(tg?.initDataUnsafe?.user?.id || "guest");
+        localStorage.setItem(`${ONBOARDING_STORAGE_KEY}:${telegramUserId}`, "1");
+      } catch {
+        // Continue into WAGRAM even when local storage is unavailable.
+      }
+      overlay.classList.add("is-dismissed");
+      window.setTimeout(() => overlay.remove(), 320);
+    });
+
+    overlay.classList.remove("hidden");
+  }
+
+  function init() {
+    initTelegram();
+    bindEvents();
+
+    // [ADDED] Keep the WAGRAM splash visible until the first account, WhatsApp
+    // connection, and chat requests have all completed (successfully or with an error).
+    const loadingScreen = $("#appLoadingScreen");
+    // [ADDED] Never leave the Mini App trapped on its splash screen if an API request hangs.
+    let initialLoadingFinished = false;
+    const finishInitialLoading = () => {
+      if (initialLoadingFinished) return;
+      initialLoadingFinished = true;
+      loadingScreen?.classList.add("is-hidden");
+      window.setTimeout(() => loadingScreen?.remove(), 380);
+      initOnboarding();
+    };
+    const loadingFallbackTimer = window.setTimeout(finishInitialLoading, 8000);
+    // [MODIFIED] Resolve the authenticated membership through loadMe() before the first chat render.
+    // This prevents Premium groups from being rendered as locked while /account is still loading.
+    loadMe().finally(() => {
+      // [ADDED] Restore the last visited page only after membership/account state is loaded.
+      let lastPage = getLastVisitedPage();
+      if (lastPage === "aiBusiness" && !isAIBusinessEligible()) lastPage = "account";
+      setPage(lastPage);
+      if (lastPage === "aiBusiness") {
+        renderAIBusinessHistory();
+        syncAIBusinessSettingsFromServer().catch((error) => {
+          console.warn("Could not restore WAMO AI settings:", error.message);
+        });
+      }
+
+      loadChats().finally(() => {
+        window.clearTimeout(loadingFallbackTimer);
+        requestAnimationFrame(finishInitialLoading);
+      });
+    });
+
+    // [ADDED] Load call history in the background so new incoming calls can badge the tab.
+    loadCalls();
+    // [ADDED] Keep HH.MM countdown aligned with the 08:00 WITA pause.
+    window.setInterval(renderFreePauseCountdown, 15000);
+    // [ADDED] Refresh the Premium expiry timer displayed in the tier badge.
+    window.setInterval(renderMembership, 15000);
+    connectRealtime();
+    // [ADDED] Poll only while a conversation is open; WebSocket remains the fast path.
+    window.setInterval(() => {
+      if (state.currentChat) refreshOpenChat();
+    }, 2000);
+    window.addEventListener("online", connectRealtime);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+  }
+
+  init();
+})();
