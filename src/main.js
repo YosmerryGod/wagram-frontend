@@ -1,8 +1,11 @@
-// [ADDED] Load the existing WAGRAM scripts in their original execution order.
-// The original DOM, CSS, and feature logic remain unchanged to preserve the UI.
-import "../app.js";
-import "../ai-chat-enhancements.js";
-import "../connection.js";
+// [MODIFIED] Set the backend URL before loading legacy scripts.
+window.MINIAPP_API_BASE =
+  __WAGRAM_API_BASE__ || window.MINIAPP_API_BASE || "/api/miniapp";
+
+// [MODIFIED] Load existing feature scripts sequentially to preserve their order.
+await import("../app.js");
+await import("../ai-chat-enhancements.js");
+await import("../connection.js");
 
 // [ADDED] Register the PWA service worker only in secure browser contexts.
 if ("serviceWorker" in navigator && window.isSecureContext) {
