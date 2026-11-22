@@ -38,6 +38,7 @@ jobs:
           node --check connection.js
           node --check ai-chat-enhancements.js
           node --check src/main.js
+          node --check public/sw.js
 
       - name: Build production bundle
         run: npm run build
@@ -57,7 +58,8 @@ jobs:
             'app.js',
             'connection.js',
             'ai-chat-enhancements.js',
-            'manifest.webmanifest'
+            'manifest.webmanifest',
+            'public/sw.js'
           ];
 
           for (const file of requiredFiles) {
@@ -76,6 +78,9 @@ jobs:
             .filter((reference) => !/^(?:https?:)?\/\//i.test(reference));
 
           const manifest = JSON.parse(fs.readFileSync('manifest.webmanifest', 'utf8'));
+          if (manifest.display !== 'standalone' || !manifest.start_url || !manifest.scope) {
+            throw new Error('PWA manifest must define standalone display, start_url, and scope');
+          }
           for (const icon of manifest.icons || []) references.push(icon.src);
 
           for (const reference of references) {
