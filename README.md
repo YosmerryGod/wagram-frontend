@@ -8,7 +8,16 @@ Frontend WAGRAM yang diekstrak dari folder `miniapp/` pada repository backend `Y
 - Antarmuka, CSS, DOM, serta logika fitur asli tetap dipertahankan selama tahap migrasi awal.
 - Entry point Vite: `src/main.js`, yang memuat skrip lama dalam urutan aslinya.
 - Belum dilakukan konversi komponen ke React. Konversi React dilakukan bertahap setelah setiap bagian memiliki pemeriksaan kesetaraan visual dan perilaku.
-- Capacitor/Android belum ditambahkan pada tahap ini.
+- Target rilis saat ini hanya Web App, Telegram Mini App, dan PWA installable.
+- APK, AAB, dan Capacitor berada di luar cakupan tahap ini.
+
+## PWA dan Telegram Mini App
+
+- Web App diakses melalui domain web.
+- Telegram Mini App tetap menggunakan Telegram Web App SDK dan backend yang sama.
+- PWA menggunakan `manifest.webmanifest` dan `public/sw.js` untuk instalasi serta cache app shell.
+- Service worker tidak melakukan cache terhadap endpoint `/api/`, sehingga data API tetap diminta ke backend.
+- Instalasi PWA memerlukan HTTPS dan browser yang mendukung instalasi aplikasi web.
 
 ## Perintah
 
