@@ -2,32 +2,43 @@
 
 Frontend WAGRAM yang diekstrak dari folder `miniapp/` pada repository backend `YosmerryGod/waTelegramConnector`.
 
-## Prinsip ekstraksi
+## Teknologi dan struktur
 
-- Mempertahankan HTML, CSS, dan JavaScript asli; tidak melakukan redesign atau migrasi framework.
-- Source awal tetap menggunakan Vanilla JavaScript.
-- Kontrak REST API dan WebSocket tetap mengikuti backend WAGRAM.
-- Perubahan konfigurasi alamat backend dilakukan terpisah setelah alamat deployment backend ditetapkan.
+- Vite digunakan untuk development server dan production build.
+- Antarmuka, CSS, DOM, serta logika fitur asli tetap dipertahankan selama tahap migrasi awal.
+- Entry point Vite: `src/main.js`, yang memuat skrip lama dalam urutan aslinya.
+- Belum dilakukan konversi komponen ke React. Konversi React dilakukan bertahap setelah setiap bagian memiliki pemeriksaan kesetaraan visual dan perilaku.
+- Capacitor/Android belum ditambahkan pada tahap ini.
+
+## Perintah
+
+```bash
+npm install
+npm run dev
+npm run build
+npm run preview
+```
+
+Hasil production build berada di folder `dist/`.
+
+## Prinsip migrasi
+
+- Tidak melakukan redesign.
+- Mempertahankan struktur HTML dan stylesheet asli.
+- Mempertahankan urutan pemuatan `app.js`, `ai-chat-enhancements.js`, dan `connection.js`.
+- Tidak mengubah kontrak REST API dan WebSocket backend.
+- Perubahan UI hanya boleh dilakukan jika diminta secara terpisah.
 
 ## Source
 
 Repository sumber: https://github.com/YosmerryGod/waTelegramConnector/tree/main/miniapp
 
-File inti yang sudah disalin:
-- `index.html`
-- `style.css`
-- `app.js`
-- `connection.js`
-- `ai-chat-enhancements.js`
-- `manifest.webmanifest`
-- SVG yang digunakan oleh antarmuka serta metadata brand berbasis teks.
+## Status aset
 
-## Status ekstraksi
-
-Ekstraksi file inti selesai. Aset biner (PNG, ICO, GIF, dan WebP), termasuk aset di paket brand, belum seluruhnya dipindahkan. Karena itu repository ini belum dinyatakan sebagai salinan 100% lengkap.
+Ekstraksi file inti sebelumnya telah dilakukan, tetapi sebagian aset biner dari repository sumber belum seluruhnya dipindahkan. Karena itu kesetaraan visual 100% belum dapat dinyatakan selesai sampai inventaris aset sumber dan target dibandingkan serta semua aset yang dipakai aplikasi tersedia.
 
 ## Konfigurasi backend
 
-Frontend sumber menggunakan `window.MINIAPP_API_BASE` dengan fallback `/api/miniapp`. Untuk hosting frontend dan backend pada origin berbeda, nilai ini perlu diarahkan ke URL API backend WAGRAM. Endpoint WebSocket mengikuti konfigurasi base API yang sama.
+Frontend membaca `window.MINIAPP_API_BASE` dengan fallback `/api/miniapp`. Untuk deployment frontend dan backend pada origin berbeda, konfigurasi alamat API harus disediakan sebelum skrip aplikasi dimuat. Environment Variable Vercel tidak otomatis tersedia di browser pada aplikasi statis.
 
 Jangan menaruh token bot, API key, atau secret backend di frontend.
