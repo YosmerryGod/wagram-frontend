@@ -2193,9 +2193,9 @@
       tab?.classList.toggle("selected", state.contactTab === key);
       tab?.setAttribute("aria-selected", String(state.contactTab === key));
     }
-    $("#contactsSearchInput").hidden = state.contactTab !== "book";
-    $("#customerContactsSearchInput").hidden = state.contactTab !== "customers";
-    $("#employeeWhitelistSearchInput").hidden = state.contactTab !== "employees";
+    $("#contactsSearchInput").hidden = true; // [MODIFIED] Search remains in the global header.
+    $("#customerContactsSearchInput").hidden = true; // [MODIFIED] Search remains in the global header.
+    $("#employeeWhitelistSearchInput").hidden = true; // [MODIFIED] Search remains in the global header.
     const label = state.contactTab === "customers" ? "Tambah pelanggan" : state.contactTab === "employees" ? "Tambah karyawan" : "Tambah kontak";
     $("#addContactButton").setAttribute("aria-label", label);
     $("#addContactButton").title = label;
