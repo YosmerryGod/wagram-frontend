@@ -14,7 +14,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <title>WAGRAM</title>
   <!-- [MODIFIED] Cache-bust CSS so Telegram reloads the corrected logo sizing rules. -->
-  <link rel="stylesheet" href="style.css?v=20261120-wamo-settings-refine-v6">
+  <link rel="stylesheet" href="/style.css?v=20261120-wamo-settings-refine-v6">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <!-- [ADDED] QR code renderer for Premium payment preview. -->
   <!-- [MODIFIED] Fallback QR renderer for Telegram WebView. -->
@@ -952,9 +952,7 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </div>
 
-  <!-- [MODIFIED] Bump the AI decision trace script version to invalidate stale Telegram WebView cache. -->
-  <script src="app.js?v=20261120-ai-decision-trace-v2"></script>
-  <script src="ai-chat-enhancements.js?v=20261120-ai-composer-fix-v2"></script>
-  <script src="connection.js?v=20261109-silent-pause-resume"></script>
+  <!-- [MODIFIED] Vite entry point; legacy scripts retain their original execution order. -->
+  <script type="module" src="/src/main.js"></script>
 </body>
 </html>

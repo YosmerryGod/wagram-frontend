@@ -29,11 +29,19 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install dependencies
+        run: npm install
+
       - name: Check JavaScript syntax
         run: |
           node --check app.js
           node --check connection.js
           node --check ai-chat-enhancements.js
+          node --check src/main.js
+          node --check public/sw.js
+
+      - name: Build production bundle
+        run: npm run build
 
       - name: Validate PWA manifest
         run: node -e "JSON.parse(require('node:fs').readFileSync('manifest.webmanifest', 'utf8')); console.log('manifest.webmanifest is valid JSON')"
@@ -50,7 +58,8 @@ jobs:
             'app.js',
             'connection.js',
             'ai-chat-enhancements.js',
-            'manifest.webmanifest'
+            'manifest.webmanifest',
+            'public/sw.js'
           ];
 
           for (const file of requiredFiles) {
@@ -65,11 +74,18 @@ jobs:
           const html = fs.readFileSync('index.html', 'utf8');
           const references = [...html.matchAll(/(?:src|href)=["']([^"']+)["']/g)]
             .map((match) => match[1].split('?')[0])
-            .filter((reference) => /\.(?:js|css|webmanifest)$/i.test(reference))
+            .filter((reference) => /\.(?:js|css|webmanifest|svg|png|jpe?g|gif|webp|ico|woff2?)$/i.test(reference))
             .filter((reference) => !/^(?:https?:)?\/\//i.test(reference));
 
+          const manifest = JSON.parse(fs.readFileSync('manifest.webmanifest', 'utf8'));
+          if (manifest.display !== 'standalone' || !manifest.start_url || !manifest.scope) {
+            throw new Error('PWA manifest must define standalone display, start_url, and scope');
+          }
+          for (const icon of manifest.icons || []) references.push(icon.src);
+
           for (const reference of references) {
-            const localPath = path.normalize(reference.replace(/^\.\//, ''));
+            if (/^(?:https?:)?\/\//i.test(reference) || reference.startsWith('data:')) continue;
+            const localPath = path.normalize(reference.split('?')[0].replace(/^\.\//, '').replace(/^\//, ''));
             if (!fs.existsSync(localPath)) {
               console.error(`Broken local frontend reference: ${reference}`);
               process.exitCode = 1;
@@ -77,5 +93,5 @@ jobs:
           }
 
           if (process.exitCode) process.exit(process.exitCode);
-          console.log('Frontend entry points and local script/style references are valid');
+          console.log('Frontend entry points, local assets, and manifest icon references are valid');
           NODE
